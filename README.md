@@ -114,6 +114,8 @@ Pixel Car Racer is a 2D drag racing game with different cars, upgrades and tourn
 * **Vanilla JavaScript (ES6+)** — Game logic, physics and controls
 * **HTML5 Canvas** — Cars, backgrounds, particles and HUD
 * **IndexedDB / localStorage** — Save data
+
+Mit license
 * **Fullscreen & Screen Orientation APIs** — Mobile fullscreen and landscape support
 * **Google Fonts** — Press Start 2P
 
