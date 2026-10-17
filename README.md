@@ -2,7 +2,7 @@
 
 # Redline 2D
 
-[▶ Play Redline 2D](https://ahcity.github.io/PixelCarRacer/)
+[▶ Play Pixel Car Racer](https://ahcity.github.io/Dragline_2D/)
 
 **Current Version:** Evo 2.4 — Redline Rebrand (formerly "Evo 3.9" under the old name; version history sections below are legacy changelog entries)
 
@@ -28,6 +28,31 @@ Redline 2D is a 2D drag racing game with different cars, upgrades and tournament
 
 * Use the on-screen controls.
 * The game runs in landscape mode on mobile.
+
+## 🆕 v2.3 Update
+
+### New
+
+* Added P2P multiplayer.
+
+* Added ghost car racing.
+
+* Added player profiles and friends.
+
+* Added new tunes and performance upgrades.
+
+### Improved
+
+* Improved car art with more detail.
+
+* Improved the UI.
+
+* Improved car physics and logic.
+
+### Fixed
+
+* Fixed mobile UI and improved responsiveness on phones.
+
 
 ## 🆕 v2.2 Update
 
@@ -89,6 +114,8 @@ Redline 2D is a 2D drag racing game with different cars, upgrades and tournament
 * **Vanilla JavaScript (ES6+)** — Game logic, physics and controls
 * **HTML5 Canvas** — Cars, backgrounds, particles and HUD
 * **IndexedDB / localStorage** — Save data
+
+Mit license
 * **Fullscreen & Screen Orientation APIs** — Mobile fullscreen and landscape support
 * **Google Fonts** — Press Start 2P
 
