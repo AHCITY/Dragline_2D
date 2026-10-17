@@ -1,11 +1,10 @@
-<img src="assets/game_banner.jpg" alt="Redline 2D Banner" width="70%">
+<img src="assets/game_banner.jpg" alt="Dragline 2D Banner" width="70%">
 
 # Redline 2D
 
-[▶ Play Pixel Car Racer](https://ahcity.github.io/Dragline_2D/)
+[▶ Play DRAGLINE 2D](https://ahcity.github.io/Dragline_2D/)
 
-**Current Version:** Evo 2.4 — Redline Rebrand (formerly "Evo 3.9" under the old name; version history sections below are legacy changelog entries)
-
+**Current Version:** Evo 2.3
 ## About
 
 Redline 2D is a 2D drag racing game with different cars, upgrades and tournaments. Race against AI and compete through the different events.
