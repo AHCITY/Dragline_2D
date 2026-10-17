@@ -1,11 +1,38 @@
+# ── Local / dev-only folders ──────────────────────────
 /inspirations/
-/oldcode.txt/
-/index.txt/
+/tools/
+/BACKUP/
 /new update/
 /.claude
 /claude_settings
+/.vscode
+
+# ── Dev-only files ────────────────────────────────────
+/oldcode.txt
+/index.txt
 /cheat-menu.dev.css
 /cheat-menu.dev.js
 /cheat-menu.dev.md
 /cheat-menu.dev.html
 /game-dev-bridge.dev.js
+
+# ── Art-generation source leftovers (not used by any code) ──
+/base_*.png
+/_sheet_*.png
+/x.png
+
+# ── Editor / OS junk ──────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+
+# ── Secrets — NEVER commit these ──────────────────────
+.env
+.env.*
+*.pem
+serviceAccountKey.json
+*adminsdk*.json
+
+# ── Node (in case it's ever added) ────────────────────
+node_modules/
