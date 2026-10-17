@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * ─── Pixel Drag Legends — Driver Profile ───────────────────────────────
+ * ─── Redline 2D — Driver Profile ───────────────────────────────────────
  *
  * A small, scalable player-identity layer that sits on top of the save
  * system. It answers "WHO is racing?" — separate from "WHAT do they own?"
@@ -32,7 +32,37 @@ const PROFILE_AVATAR_SIZE = 256;          // encoded square resolution (crisp at
 const PROFILE_AVATAR_MAX_BYTES = 22000;   // hard cap for the encoded avatar
 const PROFILE_CLOUD_DEBOUNCE_MS = 2500;
 const PROFILE_CLOUD_TIMEOUT_MS = 8000;
-
+/* Cloud mirror SELF-HEALING. The cloud copy of the profile is what every
+   friend's list renders, so a push that silently gives up reads as a
+   permanently stale PFP on other players' devices (the reported bug: the
+   avatar changed here, the friends list kept the old one forever). Any
+   failure therefore retries with bounded backoff, a permission failure
+   gets one WRITE-ONCE claim repair (the boot-time claim can lose the race
+   against the very first profile push), and connectivity/focus changes
+   trigger a throttled re-push. Capped so a hostile claim can't spin. */
+const PROFILE_CLOUD_RETRY_MAX = 6;
+const PROFILE_CLOUD_RETRY_BASE_MS = 5000;
+const PROFILE_CLOUD_RETRY_CAP_MS = 120000;
+const PROFILE_CLOUD_RECONCILE_MIN_MS = 30000;
+/* Largest string _encodeSquareAvatar can emit: 22KB decoded bytes →
+   ceil(22000/3)*4 = 29,336 base64 chars + "data:image/webp;base64," (23).
+   The migrate cap must be a STRING cap strictly above that. */
+const PROFILE_AV_MAX_CHARS = 32000;
+/* Moderation audit record travels with the avatar (owner → cloud → friends'
+   live mirrors can ignore it; the rules validate its shape). */
+const PROFILE_SERVER_MOD_TIMEOUT_MS = 15000;
+const PROFILE_MOD_SRC = /^(server|device)$/;
+function migrateMod(m) {
+    if (!m || typeof m !== 'object') return null;
+    const v = String(m.v || '');
+    const s = (+m.s);
+    const t = +m.t;
+    const src = String(m.src || '');
+    if (v !== 'dam1' || !PROFILE_MOD_SRC.test(src) || !isFinite(t) || t <= 0) return null;
+    const out = { v: v, t: Math.min(t, Date.now() + 60000), src: src };
+    if (isFinite(s) && s >= 0 && s <= 1) out.s = Math.round(s * 1000) / 1000;
+    return out;
+}
 // Identity provider registry — THE extension seam for future sign-ins.
 // The UI renders every registered provider; until a real implementation
 // exists a provider reports available() === false and signIn() returns
@@ -62,6 +92,11 @@ const Profile = {
     data: null,
     _cloudTimer: null,
     _cloudState: '',          // '' | 'on' | 'blocked' | 'off' | 'local'
+    _cloudTries: 0,           // consecutive failed pushes in this burst
+    _cloudDirty: false,       // local profile newer than last confirmed push
+    _cloudLastTryAt: 0,       // throttle floor for reconcile re-pushes
+    _claimTried: false,       // one claim repair per failure burst
+    _cloudWired: false,       // self-heal listeners installed once
     _wired: false,
 
     async init() {
@@ -77,7 +112,88 @@ const Profile = {
         this._persist();
         this._scheduleCloudSync();
         this._wirePanel();
+        this._wireCloudSelfHeal();
         this._refreshChip();
+        // Cross-device identity: when a signed-in session has a cloud-
+        // registered profile id that differs from this device's, adopt it —
+        // name + avatar + id follow the ACCOUNT. Background, never blocks
+        // boot; signed-out players keep a purely local profile.
+        this._adoptCloudIdentity();
+    },
+
+    /* WHY THIS EXISTS
+       The profile id used to be device-generated, so signing in on a new
+       device minted a fresh id and the cloud profile (name, avatar, the
+       friend graph, the wallet) stayed orphaned under the old id — the
+       "PFP doesn't sync across devices" report. pdl_uidIndex/<authUid> is
+       the missing direction: AUTH UID → profile id, owner-private, written
+       once per account. Adoption is deliberately conservative:
+         · only while signed in (RLAuth.ready),
+         · only when the indexed pid passes the pdl_idClaim ownership check
+           (a hostile or stale index can never transplant someone else's
+           identity onto this device),
+         · cloud name/avatar only fill EMPTY local slots, so a player who
+           customized before signing in never gets overwritten,
+         · dependents (Friends store, Wallet node) are re-pointed atomically
+           after the id flip. */
+    async _adoptCloudIdentity() {
+        try {
+            if (!window.RLAuth || typeof RLAuth.ready !== 'function') return;
+            for (let i = 0; i < 60 && !RLAuth.ready(); i++) {
+                await new Promise(r => setTimeout(r, 100));
+            }
+            const u = (typeof RLAuth.user === 'function') ? RLAuth.user() : null;
+            if (!u || !u.uid) return;
+            const db = this._db();
+            if (!db) return;
+            const idxRef = db.ref('pdl_uidIndex/' + u.uid);
+            let cloudPid = null;
+            try { cloudPid = await idxRef.once('value').then(s => s.val()); } catch (e) { cloudPid = null; }
+            const valid = (typeof cloudPid === 'string' && /^[0-9a-f]{16}$/.test(cloudPid)) ? cloudPid : null;
+
+            if (valid && valid !== this.data.id) {
+                // Ownership proof: the index may only transplant an identity
+                // THIS account genuinely owns in pdl_idClaim.
+                let claim = null;
+                try { claim = await db.ref('pdl_idClaim/' + valid).once('value').then(s => s.val()); } catch (e) {}
+                if (claim === u.uid) {
+                    let cloudProf = null;
+                    try { cloudProf = await db.ref('pdl_profiles/' + valid).once('value').then(s => s.val()); } catch (e) {}
+                    const localDefault = /^DRIVER( [0-9A-Fa-f]{4})?$/.test(String(this.data.name || ''));
+                    let restored = false;
+                    if (cloudProf && typeof cloudProf === 'object') {
+                        if (localDefault && typeof cloudProf.name === 'string') {
+                            const nm = this._sanitizeName(cloudProf.name);
+                            if (nm && nm !== this.data.name) { this.data.name = nm; restored = true; }
+                        }
+                        if (!this.data.av && typeof cloudProf.av === 'string' &&
+                            cloudProf.av.length <= PROFILE_AV_MAX_CHARS && cloudProf.av.indexOf('data:image/') === 0) {
+                            this.data.av = cloudProf.av; restored = true;
+                        }
+                        if (!this.data.mod) this.data.mod = migrateMod(cloudProf.mod);
+                    }
+                    this.data.id = valid;
+                    this.data.updatedAt = Date.now();
+                    this._persist();
+                    this._scheduleCloudSync();
+                    this._refreshAll();
+                    if (restored) game.showNotification('PROFILE RESTORED FROM CLOUD');
+                    // Re-point the social graph + the wallet mirror.
+                    if (typeof Friends !== 'undefined' && Friends._loaded &&
+                        typeof Friends.setProfile === 'function') {
+                        Friends.setProfile(valid);
+                    }
+                    if (typeof Wallet !== 'undefined' && typeof Wallet.rebind === 'function') {
+                        Wallet.rebind();
+                    }
+                }
+            }
+            // Register/refresh this account → profile binding (owner-only
+            // write; same pair is idempotent).
+            try { await idxRef.set(this.data.id); } catch (e) { /* offline stays local */ }
+        } catch (e) {
+            try { console.warn('[Profile] identity adoption skipped:', e && e.message); } catch (_) {}
+        }
     },
 
     // ── Public getters used across the game ─────────────────────────
@@ -129,13 +245,36 @@ const Profile = {
 
     async onAvatarPicked(file) {
         if (!file) return;
+        if (this._modBusy) { game.showNotification('ALREADY CHECKING AN IMAGE'); return; }
         if (!/^image\//.test(file.type || '')) { game.showNotification('NOT AN IMAGE FILE'); return; }
         if (file.size > 8 * 1024 * 1024) { game.showNotification('IMAGE TOO LARGE — MAX 8MB'); return; }
+        this._modBusy = true;   // released in the finally below
         try {
             const src = await this._decodeImage(file);
             const dataUrl = this._encodeSquareAvatar(src);
             if (!dataUrl) { game.showNotification('AVATAR ENCODE FAILED'); return; }
+            // MODERATION GATE (Desert Ant Labs Moderator — PFP uploads only).
+            // Runs exactly here, only for a NEWLY picked image: never at
+            // launch, never on already-applied avatars. Trusted-server
+            // verdict first where a backend exists; on-device verdict as
+            // the fallback gate. Fail-closed either way.
+            game.showNotification('CHECKING IMAGE…');
+            if (window.PFPModerator && PFPModerator.preload) PFPModerator.preload();
+            const verdict = await this._moderate(dataUrl);
+            if (!verdict.ok) {
+                if (typeof SFX !== 'undefined') SFX.error();
+                game.showNotification(verdict.reason === 'nsfw'
+                    ? 'IMAGE REJECTED — INAPPROPRIATE CONTENT'
+                    : 'MODERATION UNAVAILABLE — TRY AGAIN');
+                return;   // previous avatar stays untouched; player can retry
+            }
             this.data.av = dataUrl;
+            // Audit trail: WHY this image was admitted (model + score).
+            this.data.mod = (verdict.score === null || verdict.score === undefined) ? {
+                v: 'dam1', t: Date.now(), src: verdict.src,
+            } : {
+                v: 'dam1', s: Math.max(0, Math.min(1, verdict.score)), t: Date.now(), src: verdict.src,
+            };
             this.data.updatedAt = Date.now();
             this._persist();
             this._scheduleCloudSync();
@@ -143,12 +282,54 @@ const Profile = {
             game.showNotification('AVATAR UPDATED');
         } catch (e) {
             game.showNotification('COULD NOT READ THAT IMAGE');
+        } finally {
+            this._modBusy = false;
+        }
+    },
+
+    /* One image, one verdict. The server (where this deployment has one)
+       runs the SAME model with the native core and decides; on a purely
+       static host the on-device gate is the only enforcement point and the
+       rules' structural checks are documented around it (RULES-NOTES-v7). */
+    async _moderate(dataUrl) {
+        const server = await this._serverModerate(dataUrl).catch(() => null);
+        if (server) return server;
+        if (window.PFPModerator && typeof PFPModerator.moderate === 'function') {
+            const r = await PFPModerator.moderate(dataUrl);
+            return { ok: !!r.ok, reason: r.reason, score: r.score, src: 'device' };
+        }
+        return { ok: false, reason: 'error' };   // no gate available → reject
+    },
+
+    /* null/undefined ⇒ "no trusted backend here" (static hosting) and the
+       caller falls through to the on-device gate. A reachable server that
+       answers garbage is treated the same way — still gated, never open. */
+    async _serverModerate(dataUrl) {
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = setTimeout(() => { try { if (ctrl) ctrl.abort(); } catch (e) {} }, PROFILE_SERVER_MOD_TIMEOUT_MS);
+        try {
+            // Root-relative: the route lives at the server root (/api),
+            // not under the page's own directory (/game/...). Static hosts
+            // simply 404 this and the caller falls back to the device gate.
+            const res = await fetch('/api/pfp-moderate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: dataUrl }),
+                signal: ctrl ? ctrl.signal : undefined,
+            });
+            if (!res || !res.ok) return null;      // 404 on static hosts
+            const j = await res.json().catch(() => null);
+            if (!j || typeof j !== 'object' || typeof j.ok !== 'boolean') return null;
+            return { ok: j.ok, reason: j.ok ? undefined : 'nsfw', score: j.score, src: 'server' };
+        } finally {
+            clearTimeout(timer);
         }
     },
 
     removeAvatar() {
         if (!this.data.av) { game.showNotification('NO AVATAR TO REMOVE'); return; }
         this.data.av = null;
+        this.data.mod = null;   // the audit record belongs to the avatar
         this.data.updatedAt = Date.now();
         this._persist();
         this._scheduleCloudSync();
@@ -230,12 +411,8 @@ const Profile = {
         if (av) this.renderAvatar(av, { name: this.data.name, av: this.data.av }, '#37474f');
         const nameInput = document.getElementById('profile-name-input');
         if (nameInput && document.activeElement !== nameInput) nameInput.value = this.data.name;
-        const stats = document.getElementById('profile-stats');
-        if (stats) {
-            const s = this.data.stats;
-            const et = s.bestET ? ' \u00B7 BEST ' + s.bestET.toFixed(3) + 's' : '';
-            stats.textContent = s.wins + 'W \u2013 ' + s.losses + 'L \u00B7 ' + s.races + ' RACES' + et;
-        }
+        // (The per-profile W/L/races line was removed by design — career
+        // statistics live in the CAREER screen, not on the identity card.)
         const idEl = document.getElementById('profile-id');
         if (idEl) idEl.textContent = this.formatId(this.data.id);
         this._renderCloudStatus();
@@ -246,7 +423,15 @@ const Profile = {
     // ── Account linking row (provider buttons) ──────────────────────
     _renderAccounts() {
         const row = document.getElementById('pf-link-row');
-        if (!row || row.dataset.built === '1') return;
+        if (!row) return;
+        // RLAuth (auth.js) owns live provider state — real connected
+        // accounts, verification status and guest-upgrade actions.
+        // Delegate the whole row to it whenever the auth layer is loaded.
+        if (window.RLAuth && typeof RLAuth.renderLinkRow === 'function') {
+            RLAuth.renderLinkRow(row);
+            return;
+        }
+        if (row.dataset.built === '1') return;
         row.innerHTML = '';
         for (const id of ['google', 'playgames', 'email']) {
             const p = ProfileAuth.providers[id];
@@ -295,7 +480,12 @@ const Profile = {
             v: 1,
             id: typeof d.id === 'string' ? d.id.replace(/[^0-9a-fA-F]/g, '').toLowerCase().slice(0, 16) : '',
             name: typeof d.name === 'string' ? d.name : '',
-            av: (typeof d.av === 'string' && d.av.length <= PROFILE_AVATAR_MAX_BYTES + 4000) ? d.av : null,
+            // Cap is on the ENCODED STRING (base64 ≈ 4/3 × bytes + prefix),
+            // not on decoded bytes: a 22KB avatar is a ~29.4k-char URL and
+            // the old 26k string cap was silently wiping it on every reload
+            // (the reported "PFP doesn't persist" bug).
+            av: (typeof d.av === 'string' && d.av.length <= PROFILE_AV_MAX_CHARS) ? d.av : null,
+            mod: migrateMod(d.mod),
             provider: (d.provider && typeof d.provider === 'string') ? d.provider : 'local',
             linkedUid: (d.linkedUid && typeof d.linkedUid === 'string') ? d.linkedUid.slice(0, 128) : null,
             createdAt: +d.createdAt || 0,
@@ -440,21 +630,95 @@ const Profile = {
     },
 
     _scheduleCloudSync() {
+        this._cloudDirty = true;
         if (this._cloudTimer) clearTimeout(this._cloudTimer);
         this._cloudTimer = setTimeout(() => { this._cloudSync(); }, PROFILE_CLOUD_DEBOUNCE_MS);
     },
 
+    /* Self-heal triggers: connection restored, tab focused again. Only
+       acts when the mirror is not confirmed healthy (or local data is
+       newer than the last confirmed push), and at most once per
+       PROFILE_CLOUD_RECONCILE_MIN_MS — a background nicety, never a
+       write storm. This is what lets a PFP change that failed under an
+       old ruleset / while offline reach the cloud WITHOUT the player
+       having to touch their profile again. */
+    _wireCloudSelfHeal() {
+        if (this._cloudWired) return;
+        this._cloudWired = true;
+        window.addEventListener('online', () => this._reconcileCloud());
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') this._reconcileCloud();
+        });
+    },
+
+    _reconcileCloud() {
+        if (this._cloudState === 'on' && !this._cloudDirty) return;   // healthy, nothing owed
+        const now = Date.now();
+        if (this._cloudLastTryAt && now - this._cloudLastTryAt < PROFILE_CLOUD_RECONCILE_MIN_MS) return;
+        this._cloudLastTryAt = now;
+        this._scheduleCloudSync();
+    },
+
     async _cloudSync() {
+        // rules-v4-anonauth grants every cloud path to AUTHENTICATED
+        // RTDB connections only. If the auth layer is still resolving
+        // (slow network), re-debounce instead of writing into a
+        // not-yet-authenticated connection. The auth watchdog bounds
+        // this loop (ready=true after 6 s worst case).
+        if (window.RLAuth && typeof RLAuth.ready === 'function' && !RLAuth.ready()) {
+            this._scheduleCloudSync();
+            return;
+        }
+        // Signed out: there is nothing to authenticate the write with.
+        // Settle honestly into LOCAL ONLY instead of attempting writes the
+        // rules will deny and then retrying them forever.
+        if (window.RLAuth && typeof RLAuth.ready === 'function' && RLAuth.ready() &&
+            typeof RLAuth.user === 'function' && !RLAuth.user()) {
+            this._cloudTries = 0;
+            this._setCloudState('local');
+            return;
+        }
         const db = this._db();
         if (!db || !this.data.id) { this._setCloudState('local'); return; }
         const d = this.data;
-        const payload = { name: d.name, av: d.av, stats: d.stats, provider: d.provider, updatedAt: Date.now() };
+        const payload = { name: d.name, av: d.av, mod: d.mod || null, stats: d.stats, provider: d.provider, updatedAt: Date.now() };
+        this._cloudLastTryAt = Date.now();
         try {
             await this._watchdog(db.ref('pdl_profiles/' + d.id).update(payload), PROFILE_CLOUD_TIMEOUT_MS);
+            this._cloudTries = 0;
+            this._cloudDirty = false;
+            this._claimTried = false;
             this._setCloudState('on');
         } catch (e) {
             this._setCloudState(this._isRulesError(e) ? 'blocked' : 'off');
+            this._cloudRecover(e);   // never a silent dead end
         }
+    },
+
+    /* A failed push must self-heal on its own — friends' lists read the
+       CLOUD copy, so giving up here is exactly how a PFP change never
+       reached them. permission_denied first gets ONE write-once claim
+       repair (idempotent when our uid already owns it; legally refused
+       when another account does), then bounded exponential retries cover
+       offline / timeout / rules races. After PROFILE_CLOUD_RETRY_MAX the
+       loop stands down honestly: the panel keeps showing BLOCKED and the
+       next boot, 'online' or focus re-trigger takes another shot. */
+    _cloudRecover(err) {
+        this._cloudTries = (this._cloudTries || 0) + 1;
+        if (this._isRulesError(err) && !this._claimTried) {
+            this._claimTried = true;
+            const u = (window.RLAuth && typeof RLAuth.user === 'function') ? RLAuth.user() : null;
+            const db = this._db();
+            if (u && u.uid && db && this.data && this.data.id) {
+                try { db.ref('pdl_idClaim/' + this.data.id).set(u.uid).catch(() => {}); } catch (e) {}
+            }
+        }
+        if (this._cloudTries > PROFILE_CLOUD_RETRY_MAX) return;
+        const delay = Math.min(
+            PROFILE_CLOUD_RETRY_BASE_MS * Math.pow(2, this._cloudTries - 1),
+            PROFILE_CLOUD_RETRY_CAP_MS);
+        if (this._cloudTimer) clearTimeout(this._cloudTimer);
+        this._cloudTimer = setTimeout(() => { this._cloudSync(); }, delay);
     },
 
     _setCloudState(s) {

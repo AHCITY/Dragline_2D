@@ -1,0 +1,534 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   Redline 2D — Firebase Auth gate & account layer  (auth.css)
+   ----------------------------------------------------------------------------
+   Every rule is prefixed `rla-` so nothing can collide with the game's
+   stylesheet. The visual language is lifted 1:1 from style.css:
+     · 'Press Start 2P' everywhere, uppercase, letter-spaced microcopy
+     · black panels, 2px borders, hard offset shadows (4px 4px 0 #000)
+     · brand accents: red #ef5350/#c62828 (primary), yellow #ffeb3b on
+       red shadow for the title (matches #main-menu h1), cyan #4dd0e1
+       for the guest path (matches GHOST RACE), green #66bb6a success
+   PAGE MODEL
+     While the gate is up the game stage is NOT rendered at all
+     (html.rla-locked / html.rla-bootlock hide #game-container) — the
+     sign-in screen is its own page with its own STATIC background:
+     dark asphalt, a faint garage grid and dim checkered kerbs. Nothing
+     moves, nothing of the game leaks through, nothing distracts.
+   Security posture: the DOM is built in auth.js with createElement +
+   textContent ONLY — no dynamic markup is ever injected, so there is no
+   HTML/script injection surface in anything this stylesheet decorates.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.rla-hidden { display: none !important; }
+
+/* Boot-lock: applied by the inline <head> script BEFORE first paint when
+   no persisted session exists — the game never flashes. rla-locked: the
+   live lock while the gate is up. Both turn the browser tab into the
+   sign-in page, full stop. */
+html.rla-bootlock #game-container,
+html.rla-bootlock #rotate-prompt,
+html.rla-locked  #game-container,
+html.rla-locked  #rotate-prompt { display: none !important; }
+html.rla-bootlock body,
+html.rla-locked  body { background: #0a0a0d; }
+
+/* ── Full-page sign-in screen ─────────────────────────────────────────── */
+#rla-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 240;                      /* above every menu overlay (z:10) + rotate hint */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+             max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    /* STATIC retro backdrop: dark asphalt gradient + faint garage-grid
+       lines + a soft red glow low on the horizon. Pure CSS, zero motion,
+       zero backdrop reads of the (hidden) game. */
+    background:
+        radial-gradient(130% 90% at 50% 118%, rgba(198, 40, 40, 0.14) 0%, rgba(198, 40, 40, 0) 52%),
+        radial-gradient(120% 80% at 50% -18%, rgba(239, 83, 80, 0.07) 0%, rgba(239, 83, 80, 0) 46%),
+        repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.020) 0 1px, transparent 1px 48px),
+        repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.020) 0 1px, transparent 1px 48px),
+        linear-gradient(180deg, #0c0d11 0%, #0a0a0d 58%, #070708 100%);
+    font-family: 'Press Start 2P', cursive;
+    overscroll-behavior: contain;
+}
+/* Dim checkered kerb strips — top and bottom edge of the page. Static. */
+#rla-overlay::before,
+#rla-overlay::after {
+    content: '';
+    position: absolute;
+    left: 0; right: 0;
+    height: 10px;
+    pointer-events: none;
+    background-color: #0d0e12;
+    background-image:
+        linear-gradient(45deg, #1a1b22 25%, transparent 25%, transparent 75%, #1a1b22 75%),
+        linear-gradient(45deg, #1a1b22 25%, transparent 25%, transparent 75%, #1a1b22 75%);
+    background-size: 10px 10px;
+    background-position: 0 0, 5px 5px;
+    opacity: 0.85;
+}
+#rla-overlay::before { top: 0; }
+#rla-overlay::after  { bottom: 0; }
+
+/* ── Card (mirrors .pf-panel: gradient, 2px border, layered shadows) ── */
+.rla-card {
+    position: relative;
+    width: min(378px, 96vw);
+    max-height: 100%;
+    min-height: 0;
+    overflow-y: auto;                  /* fallback ONLY — the compact layout below fits without scrolling */
+    overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: #3a3f4a #0d0e12;
+    background: linear-gradient(180deg, #14161b 0%, #0d0e12 100%);
+    border: 2px solid #2c2f38;
+    box-shadow: 0 0 0 4px #050505, 8px 8px 0 rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    padding: 16px 16px 12px;
+    text-align: center;
+    color: #eceff1;
+    animation: rla-in 0.22s ease-out both;
+}
+.rla-card::-webkit-scrollbar { width: 6px; }
+.rla-card::-webkit-scrollbar-thumb { background: #3a3f4a; }
+/* Redline streak across the top of the card */
+.rla-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #ef5350 0%, #b71c1c 34%, rgba(183, 28, 28, 0) 82%);
+    pointer-events: none;
+}
+@keyframes rla-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.99); }
+    to   { opacity: 1; transform: translateY(0)   scale(1); }
+}
+
+/* ── Brand header (mirrors #main-menu h1: yellow, red hard shadow, skew) */
+.rla-brand {
+    font-family: 'Press Start 2P', cursive;
+    font-size: clamp(15px, 3.8vh, 20px);
+    line-height: 1.25;
+    letter-spacing: -1px;
+    color: #ffeb3b;
+    text-shadow: 4px 4px 0 #b71c1c;
+    transform: skew(-5deg);
+    margin: 1px 0 12px;
+    user-select: none; -webkit-user-select: none;
+}
+.rla-brand .rla-2d { color: #fff; }
+
+/* ── Status banner (role=alert, aria-live) — only visible with content ── */
+.rla-banner {
+    display: none;
+    font-size: 7px;
+    line-height: 1.9;
+    letter-spacing: 0.5px;
+    padding: 7px 9px;
+    margin: 0 0 10px;
+    border: 1px solid #333;
+    background: #0a0a0a;
+    text-align: center;
+    word-break: break-word;
+}
+.rla-banner.rla-show { display: block; animation: rla-slide 0.18s ease-out both; }
+@keyframes rla-slide {
+    from { opacity: 0; transform: translateY(-5px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.rla-banner.rla-err  { color: #ff8a80; border-color: #8b3a3a; box-shadow: inset 0 0 10px rgba(139, 58, 58, 0.25); }
+.rla-banner.rla-ok   { color: #69f0ae; border-color: #1b5e20; box-shadow: inset 0 0 10px rgba(27, 94, 32, 0.25); }
+.rla-banner.rla-info { color: #4fc3f7; border-color: #1e4d6b; }
+.rla-banner.rla-warn { color: #ffd54f; border-color: #8d6e2f; }
+.rla-shake { animation: rla-shake 0.3s linear 1; }
+@keyframes rla-shake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-5px); }
+    40% { transform: translateX(5px); }
+    60% { transform: translateX(-4px); }
+    80% { transform: translateX(4px); }
+}
+
+/* ── Tabs (SIGN IN | CREATE ACCOUNT) ─────────────────────────────────── */
+.rla-tabs {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 10px;
+}
+.rla-tab {
+    flex: 1 1 0;
+    font-family: 'Press Start 2P', cursive;
+    font-size: 8px;
+    letter-spacing: 1px;
+    padding: 9px 4px;
+    background: #0a0a0a;
+    border: 2px solid #333;
+    color: #9e9e9e;
+    cursor: pointer;
+    text-transform: uppercase;
+    user-select: none; -webkit-user-select: none;
+    transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+.rla-tab:hover { color: #fff; border-color: #555; }
+.rla-tab.rla-on {
+    color: #fff;
+    background: #1a0f10;
+    border-color: #ef5350;
+    box-shadow: inset 0 0 12px rgba(239, 83, 80, 0.22), 3px 3px 0 #000;
+}
+.rla-tab:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+
+/* ── Form scaffolding ────────────────────────────────────────────────── */
+.rla-form { display: flex; flex-direction: column; gap: 9px; text-align: left; }
+.rla-form[aria-hidden="true"] { display: none; }
+.rla-field { display: flex; flex-direction: column; gap: 4px; }
+.rla-label {
+    font-size: 7px;
+    letter-spacing: 1px;
+    color: #9e9e9e;
+    text-transform: uppercase;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+.rla-label .rla-optional { color: #555; letter-spacing: 0; }
+
+/* Inputs mirror .mp-code-input (dark inset) but neutral text color.
+   Desktop 11px / ≥16px on coarse pointers so iOS never auto-zooms. */
+.rla-input {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: 'Press Start 2P', cursive;
+    font-size: 11px;
+    padding: 10px 12px;
+    background: #0a0a0a;
+    border: 2px solid #444;
+    color: #eceff1;
+    letter-spacing: 1px;
+    box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.8);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    -webkit-border-radius: 0;
+    border-radius: 0;
+}
+.rla-input:focus {
+    outline: none;
+    border-color: #ef5350;
+    box-shadow: 0 0 14px rgba(239, 83, 80, 0.3), inset 0 0 12px rgba(0, 0, 0, 0.8);
+}
+.rla-input::placeholder { color: #444; letter-spacing: 2px; }
+.rla-input.rla-bad { border-color: #8b3a3a; box-shadow: 0 0 10px rgba(139, 58, 58, 0.35), inset 0 0 12px rgba(0, 0, 0, 0.8); }
+.rla-errline {
+    font-size: 7px;
+    line-height: 1.7;
+    color: #ff8a80;
+    letter-spacing: 0.5px;
+    min-height: 12px;
+}
+/* 16px inputs on phones: prevents iOS Safari's focus auto-zoom (same
+   technique style.css uses for the room-code / name inputs). Two triggers:
+   pointer:coarse (pure media query) + the game's own body.mobile class
+   (device detection in game.js) so hybrids are covered either way. */
+@media (pointer: coarse) {
+    .rla-input { font-size: 16px; padding: 9px 12px; }
+}
+body.mobile .rla-input { font-size: 16px; padding: 9px 12px; }
+
+/* Caps-lock inline warning (auth.js toggles it from keyboard events) */
+.rla-caps { display: none; font-size: 7px; letter-spacing: 1px; color: #ffd54f; line-height: 1.8; }
+.rla-caps.rla-show { display: block; }
+
+/* Password wrapper + visibility toggle */
+.rla-pw-wrap { position: relative; }
+.rla-pw-wrap .rla-input { padding-right: 42px; }
+.rla-eye {
+    position: absolute;
+    top: 50%; right: 6px;
+    transform: translateY(-50%);
+    width: 32px; height: 32px;
+    display: flex; justify-content: center; align-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    color: #666;
+    cursor: pointer;
+    padding: 0;
+}
+.rla-eye:hover, .rla-eye:focus-visible { color: #fff; }
+.rla-eye:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 1px; }
+.rla-eye svg { width: 16px; height: 16px; display: block; }
+
+/* Password strength meter (register) */
+.rla-meter { display: flex; gap: 4px; align-items: center; }
+.rla-meter i {
+    flex: 1 1 0;
+    height: 4px;
+    background: #1c1f26;
+    border: 1px solid #262a33;
+    transition: background 0.15s, border-color 0.15s;
+}
+.rla-meter i.rla-s1 { background: #c62828; border-color: #ef5350; }
+.rla-meter i.rla-s2 { background: #ff9800; border-color: #ffb74d; }
+.rla-meter i.rla-s3 { background: #ffeb3b; border-color: #fff176; }
+.rla-meter i.rla-s4 { background: #66bb6a; border-color: #81c784; }
+.rla-meter-label { font-size: 6px; letter-spacing: 1px; color: #777; min-width: 44px; text-align: right; }
+
+/* ── Buttons (mirrors .menu-btn mechanics: hard shadow, translate press) */
+.rla-btn {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px 8px;
+    background: #c62828;
+    border: 2px solid #ef5350;
+    color: #fff;
+    cursor: pointer;
+    box-shadow: 4px 4px 0 #000;
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.45);
+    user-select: none; -webkit-user-select: none;
+    transition: transform 0.06s, box-shadow 0.06s, background 0.12s, filter 0.12s;
+    display: flex; justify-content: center; align-items: center; gap: 9px;
+}
+.rla-btn:hover  { background: #d32f2f; transform: translateX(-2px); }
+.rla-btn:active { transform: translate(2px, 2px); box-shadow: 0 0 0 #000; filter: brightness(1.25); }
+.rla-btn:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+.rla-btn[disabled], .rla-btn.rla-busy {
+    opacity: 0.45;
+    pointer-events: none;
+}
+
+/* Green confirm (register submit / resend verify) */
+.rla-btn.rla-green { background: #2e7d32; border-color: #66bb6a; }
+.rla-btn.rla-green:hover { background: #388e3c; }
+
+/* Guest — spectral cyan, its own kind of entry (mirrors .ghost-btn) */
+.rla-btn.rla-guest {
+    background: #0f3438;
+    border-color: #4dd0e1;
+    color: #b2ebf2;
+    box-shadow: 4px 4px 0 #000, 0 0 12px rgba(77, 208, 225, 0.28);
+    text-shadow: none;
+}
+.rla-btn.rla-guest:hover { background: #14494f; }
+.rla-btn.rla-ghosty { background: #1c222b; border-color: #455a64; color: #cfd8dc; text-shadow: none; }
+.rla-btn.rla-ghosty:hover { background: #232b36; }
+.rla-btn.rla-danger { background: #7f1d1d; border-color: #ef5350; }
+
+/* Google — official light button per brand guidelines */
+.rla-google {
+    background: #ffffff;
+    border-color: #ffffff;
+    color: #1f1f1f;
+    text-shadow: none;
+}
+.rla-google:hover { background: #f1f3f4; }
+.rla-google svg { width: 16px; height: 16px; flex: 0 0 auto; display: block; }
+
+/* Small utility button (resend, manage…) */
+.rla-mini {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 7px;
+    letter-spacing: 1px;
+    padding: 8px 10px;
+    background: #1c222b;
+    border: 1px solid #455a64;
+    color: #cfd8dc;
+    cursor: pointer;
+    text-transform: uppercase;
+    box-shadow: 2px 2px 0 #000;
+    user-select: none; -webkit-user-select: none;
+    transition: all 0.05s;
+    display: inline-flex; justify-content: center; align-items: center; gap: 6px;
+}
+.rla-mini:hover { color: #fff; border-color: #78909c; background: #232b36; }
+.rla-mini:active { transform: translate(2px, 2px); box-shadow: 0 0 0 #000; }
+.rla-mini:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+.rla-mini[disabled] { opacity: 0.45; pointer-events: none; }
+.rla-mini.rla-mini-green { color: #69f0ae; border-color: #1b5e20; }
+.rla-mini.rla-mini-warn  { color: #ffd54f; border-color: #8d6e2f; }
+
+/* Big single-entry button for the profile-panel link row — the account
+   center behind it owns every per-provider action. */
+.rla-manage-big {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 15px 12px;
+    background: #12271c;
+    border: 1px solid #2e7d32;
+    color: #69f0ae;
+    cursor: pointer;
+    text-transform: uppercase;
+    box-shadow: 3px 3px 0 #000;
+    width: 100%;
+    display: flex; justify-content: center; align-items: center; gap: 8px;
+    user-select: none; -webkit-user-select: none;
+    transition: all 0.05s;
+}
+.rla-manage-big:hover { background: #173526; border-color: #43a047; color: #b9f6ca; }
+.rla-manage-big:active { transform: translate(3px, 3px); box-shadow: 0 0 0 #000; }
+.rla-manage-big:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+body.mobile .rla-manage-big { font-size: 8px; padding: 13px 10px; }
+
+/* ── Divider (— OR —) ────────────────────────────────────────────────── */
+.rla-div {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 9px 0;
+    color: #555;
+    font-size: 7px;
+    letter-spacing: 2px;
+    user-select: none; -webkit-user-select: none;
+}
+.rla-div::before, .rla-div::after {
+    content: '';
+    flex: 1 1 auto;
+    height: 2px;
+    background: #1c1f26;
+}
+
+/* ── Inline link row (forgot password / back) ────────────────────────── */
+.rla-links {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    min-height: 14px;
+}
+.rla-linkbtn {
+    background: none;
+    border: none;
+    padding: 3px 0;
+    font-family: 'Press Start 2P', cursive;
+    font-size: 7px;
+    letter-spacing: 1px;
+    color: #4fc3f7;
+    cursor: pointer;
+    text-transform: uppercase;
+    border-bottom: 1px dashed #1e4d6b;
+}
+.rla-linkbtn:hover { color: #fff; border-bottom-color: #fff; }
+.rla-linkbtn:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+
+/* ── Manage (account) card bits ──────────────────────────────────────── */
+.rla-acct-rows { display: flex; flex-direction: column; gap: 6px; margin: 0 0 14px; }
+.rla-acct-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    background: #101216;
+    border: 1px solid #2c2f38;
+    padding: 9px 11px;
+    text-align: left;
+}
+.rla-acct-k { font-size: 7px; color: #777; letter-spacing: 1px; flex: 0 0 auto; }
+.rla-acct-v { font-size: 8px; color: #eceff1; letter-spacing: 0.5px; word-break: break-all; text-align: right; line-height: 1.8; }
+.rla-badge {
+    display: inline-block;
+    font-size: 6px;
+    letter-spacing: 1px;
+    padding: 3px 6px;
+    border: 1px solid #333;
+    color: #9e9e9e;
+    margin-left: 7px;
+    vertical-align: middle;
+}
+.rla-badge.rla-b-ok   { color: #69f0ae; border-color: #1b5e20; }
+.rla-badge.rla-b-warn { color: #ffd54f; border-color: #8d6e2f; }
+.rla-badge.rla-b-guest{ color: #b2ebf2; border-color: #4dd0e1; }
+.rla-badge.rla-b-g    { color: #eceff1; border-color: #455a64; }
+.rla-actions { display: flex; flex-direction: column; gap: 8px; }
+.rla-note { font-size: 7px; color: #6b7280; line-height: 1.9; letter-spacing: 0.5px; text-align: left; }
+
+/* ── Verify-email pill on the main menu ──────────────────────────────── */
+.rla-pill {
+    position: absolute;
+    top: calc(max(15px, env(safe-area-inset-top)) + 88px);
+    left: max(20px, env(safe-area-inset-left));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.82);
+    border: 1px solid #8d6e2f;
+    color: #ffd54f;
+    font-family: 'Press Start 2P', cursive;
+    font-size: 7px;
+    letter-spacing: 0.5px;
+    padding: 7px 9px;
+    z-index: 6;
+    max-width: min(330px, 72vw);
+}
+.rla-pill span.rla-pill-text { line-height: 1.8; }
+.rla-pill .rla-pillbtn {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 6px;
+    padding: 5px 6px;
+    background: #1c222b;
+    border: 1px solid #8d6e2f;
+    color: #ffd54f;
+    cursor: pointer;
+    flex: 0 0 auto;
+    text-transform: uppercase;
+}
+.rla-pill .rla-pillbtn:hover { background: #232b36; color: #fff; }
+.rla-pill .rla-pillbtn.rla-x { border-color: #555; color: #777; }
+
+/* ── Provider badge on the driver chip ───────────────────────────────── */
+.rla-chip-badge {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 6px;
+    letter-spacing: 1px;
+    padding: 3px 5px;
+    border: 1px solid #333;
+    color: #777;
+    background: rgba(0, 0, 0, 0.5);
+    margin-left: 2px;
+    user-select: none; -webkit-user-select: none;
+}
+.rla-chip-badge.rla-b-ok    { color: #69f0ae; border-color: #1b5e20; }
+.rla-chip-badge.rla-b-warn  { color: #ffd54f; border-color: #8d6e2f; }
+.rla-chip-badge.rla-b-guest { color: #b2ebf2; border-color: #4dd0e1; }
+.rla-chip-badge.rla-b-g     { color: #eceff1; border-color: #455a64; }
+
+/* ── Link row inside the Driver Profile panel (delegated from auth.js) ─ */
+.rla-linkrow { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.rla-linkrow .rla-acct-row { align-items: center; }
+
+/* ── Short-viewport compression — the card itself never scrolls on any
+      normal phone or desktop; this tier squeezes the extreme cases
+      (landscape phones, tiny preview panes). The internal scrollbar
+      remains as the absolute last resort. ───────────────────────────── */
+@media (max-height: 620px) {
+    #rla-overlay { padding: 8px; }
+    .rla-card { padding: 10px 14px 8px; }
+    .rla-brand { font-size: 14px; margin-bottom: 8px; }
+    .rla-tabs { margin-bottom: 8px; }
+    .rla-tab { padding: 7px 4px; }
+    .rla-div { margin: 6px 0; }
+    .rla-input { padding: 6px 10px; font-size: 10px; }
+    .rla-btn { padding: 8px 8px; font-size: 9px; }
+    .rla-form { gap: 6px; }
+    .rla-banner { margin-bottom: 6px; padding: 5px 8px; }
+    .rla-errline { min-height: 0; }
+    .rla-meter { display: none; }
+    .rla-links { min-height: 0; }
+}
+@media (max-height: 470px) {
+    .rla-brand { font-size: 12px; margin-bottom: 5px; }
+    .rla-tab { font-size: 7px; }
+    .rla-btn { padding: 6px 8px; font-size: 8px; }
+    .rla-div { margin: 4px 0; }
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+    .rla-card { animation: none; }
+    .rla-shake { animation: none; }
+    .rla-btn, .rla-mini, .rla-tab, .rla-input { transition: none; }
+    .rla-banner.rla-show { animation: none; }
+}

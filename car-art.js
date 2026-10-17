@@ -215,9 +215,14 @@
         a.height = GROUND - a.topY;
         // Tire radii follow the car so a scaling silhouette scales its wheels.
         a.tireR = Math.max(5, a.height * TARGET_WHEEL);
-        // 1.12 keeps a thin shadow gap above the tread - enough to read as an
-        // opening, not so much that the well becomes a dark crescent.
-        a.arch = a.arch || Math.max(6, a.tireR * 1.12);
+        /* Arch opening vs tire. Measured off the reference builds, which sit
+           slammed: the gap between the top of the tread and the underside of
+           the fender lip is only 2-8% of the tire radius. The old 1.12 (a 12%
+           gap) opened a wide dark crescent above every tire that swallowed the
+           upper body and made the wheel look undersized — the "tires are too
+           small" complaint. 1.05 keeps a thin shadow line so the arch still
+           reads as an opening, without the void. */
+        a.arch = a.arch || Math.max(6, a.tireR * 1.05);
 
         if (a.belt) a.belt = ROCKER + (a.belt - ROCKER) * k;
         if (a.deck) { a.deck[1] = ROCKER + (a.deck[1] - ROCKER) * k; }
@@ -383,14 +388,28 @@
             // Garage scale: real curved lettering. Cars are drawn side-on, so
             // only the NEAR sidewall is visible - lettering the far one too
             // stacks two brands on the same ring and reads as a spiral.
-            // Cap height is a fraction of the SIDEWALL, not the radius: a font
-            // sized off the radius outgrows the band it has to sit in.
-            const fs = Math.max(0.5, (R - rim) * 0.85);
+            const n = brand.length;
+            /* Lettering fits a FIXED arc instead of growing one.
+               The arc is pinned at ~126 deg of the upper sidewall and the cap
+               height is then solved to fit it. Two earlier versions got this
+               wrong in opposite directions: taking min() of the bounds packed
+               11 glyphs shoulder-to-shoulder with no breathing space, and
+               taking max() let a long brand wrap the ENTIRE wheel so the
+               letters chased each other around the tire as it spun - which
+               reads as visual noise and is genuinely unpleasant to watch.
+               Sizing the FONT to a fixed arc is what keeps both the spacing
+               and the containment. */
+            const ARC = 2.2;                     // radians of sidewall used
+            const step = ARC / n;                // angle allotted per glyph
+            // Two caps, whichever is smaller wins:
+            //   - the SIDEWALL is (R - rim) thick; a font sized off the radius
+            //     outgrows the band it has to sit in
+            //   - the ARC gives each glyph band*step of length to live in,
+            //     and 0.80 of that leaves visible air on both sides
+            const fs = Math.max(0.5, Math.min((R - rim) * 0.85, band * step * 0.80));
             ctx.font = 'bold ' + fs.toFixed(2) + 'px "Press Start 2P", monospace';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             ctx.fillStyle = 'rgba(238,238,232,.9)';
-            const n = brand.length;
-            const step = Math.min(fs * 0.86 / band, 1.9 / n);   // never wrap past ~110 deg
             for (let i = 0; i < n; i++) {
                 ctx.save();
                 ctx.rotate((i - (n - 1) / 2) * step);

@@ -48,9 +48,14 @@ class Car {
             performanceGearbox: false, swapped: false, turbo: 0, nos: 0,
         };
 
-        this.applyUpgrades();
-        this.reset();
-    }
+        // Physics-layer difficulty hook for the AI driver (game.js): a
+        // smooth 0..1+ multiplier on delivered torque. Humans and ghosts
+        // always run 1; the AI's capped catch-up band is applied here so
+        // rubber-banding touches the CAR, never the driver's inputs.
+        this.torqueMult = 1;
+        this.applyUpgrades();
+        this.reset();
+    }
 
     _randomCustomization() {
         // Note: CUSTOMIZATION object is defined in game.js or loaded globally. 
@@ -133,7 +138,79 @@ class Car {
         // wheel force now literally is torque x ratio / wheel radius.
         let best = 0;
         for (const [r, t] of TORQUE_CURVE) best = Math.max(best, t * r);
+        this._curveBest = best;
         this._peakTorque = (this.hp * 745.7) / (best * this.redline * Math.PI / 30);
+    }
+
+    /* Peak crank torque for the CURRENT hp.
+       _peakTorque is cached by applyUpgrades(), but hp is also written
+       externally (the AI opponent scales hp by difficulty AFTER the Car is
+       built, to handicap it without touching its catalog entry). Reading the
+       cache there meant the displayed hp was 67% while the engine still
+       pulled at 100%, so the entire difficulty ramp did nothing on track.
+       Deriving on demand keeps the two in lockstep for any future caller. */
+    peakTorque() {
+        const best = this._curveBest ||
+            (this._curveBest = TORQUE_CURVE.reduce((m, [r, t]) => Math.max(m, t * r), 0));
+        return (this.hp * 745.7) / (best * this.redline * Math.PI / 30);
+    }
+
+    /* The ONE definition of available traction.
+       getEngineForce() caps wheel force with this, and update() separately
+       decides whether the rears are breaking loose — those must be the SAME
+       number. They used to differ: the cap included launchGripBonus while the
+       slip detector ignored it, so a soft-launch tune could pull ~11% past the
+       traction limit the physics believed in with no wheelspin reported, and a
+       hard-pressure tune could trip wheelspin on force it was legally allowed
+       to deliver. Sharing one accessor makes that class of bug impossible. */
+    maxTraction() {
+        let grip = Math.max(0.45, this.grip + this.launchGripBonus);
+        // Weight transfer during the launch window: a hard dump plants the
+        // rear tires (see judgeLaunch) — traction scales with quality.
+        if (this._launchTimer > 0) grip *= 1 + LAUNCH_GRIP_BONUS * this._launchQuality;
+        return this.weight * G * grip * 0.7;
+    }
+
+    /* ─── THE LAUNCH — a clutch dump, not a gearshift ──────────────────
+       Judged ONCE, at the moment 1st goes in under green: the only input
+       is the rev the engine carried out of the staging box. Higher staged
+       rpm = the engine pulls harder (torque curve + bonus) AND the tires
+       hook up better (weight transfer → traction window), so a braver
+       hold at the line is ALWAYS a better launch. The shift-window
+       machinery (perfect/good/early/late) never judges this moment, and
+       the staged revs are never slammed down to wheel demand — the
+       clutch-slip zone bleeds them naturally as the car hooks up. */
+    judgeLaunch() {
+        if (this._launchJudged) return;
+        this._launchJudged = true;
+        if (this.gear !== 1 || typeof game === 'undefined' || !game.raceState) return;
+        const staged = Math.max(0, Math.min(this.redline, this.rpm || 0));
+        this.launchRpm = staged;
+        const q = this._launchQuality = Math.min(1, staged / (this.redline * LAUNCH_PERFECT_RATIO));
+        this._launchTimer = LAUNCH_TIME;
+        // Engagement cut shrinks as the revs climb — a high-rpm dump bites NOW.
+        this.shiftTimer = Math.max(this.shiftTimer,
+            LAUNCH_ENGAGE_MIN + (LAUNCH_ENGAGE_MAX - LAUNCH_ENGAGE_MIN) * (1 - q));
+        this._bogTimer = 0;
+        this._stallNotified = false;
+        // Feedback only on the player's own car, off the line, in a real run.
+        if (this === game.playerCar && game.raceState === 'RUNNING' && this.speed < 0.5) {
+            if (q >= 0.85) {
+                game.showNotification('PERFECT LAUNCH!');
+                game.screenShake = 5;
+                if (typeof SFX !== 'undefined') SFX.shift('perfect');
+            } else if (q >= 0.55) {
+                game.showNotification('GOOD LAUNCH');
+                game.screenShake = 2;
+                if (typeof SFX !== 'undefined') SFX.shift('good');
+            } else if (q >= 0.25) {
+                game.showNotification('LOW RPM LAUNCH');
+                game.screenShake = 1;
+            } else {
+                game.showNotification('BOGGED LAUNCH — REV HIGHER AT THE LINE');
+                game.screenShake = 1;
+            }
+        }
     }
 
     reset() {
@@ -145,7 +222,15 @@ class Car {
         this.brake = 0;
         this.clutch = 0;
         this.shiftTimer = 0;
-        this.reactionTime = 0.5;
+        // Restore the DEFAULT 0.5s only when nothing else has claimed this
+        // car's reaction time. The AI opponent is handed a deliberately
+        // tuned reaction (0.12-0.32s, scaling with career/round) BEFORE
+        // startRaceMode calls reset() — hardcoding 0.5 here silently erased
+        // it, so every opponent launched at the same flat pace regardless of
+        // difficulty and the whole ramp did nothing.
+        if (!Number.isFinite(this.reactionTime) || this.reactionTime <= 0) {
+            this.reactionTime = 0.5;
+        }
         this.finished = false;
         this.finishTime = 0;
         this.reactionRecorded = 0;
@@ -162,6 +247,14 @@ class Car {
         this.nosTank = this.nos > 0 ? 1 : 0;   // full bottle at the line
         this.nosActive = false;
         this.nosSpraying = false;
+        this.torqueMult = 1;
+        // Launch state (see judgeLaunch): quality 0..1 from the staged rev,
+        // the window timer, the rev that was judged, and the once-per-race
+        // flag that keeps a launch judged exactly once.
+        this._launchQuality = 0;
+        this._launchTimer = 0;
+        this.launchRpm = 0;
+        this._launchJudged = false;
     }
 
     // Bottle size in seconds of continuous spray — stages buy duration.
@@ -180,8 +273,11 @@ class Car {
         // through the gearbox. No speed term: a torque curve is a torque
         // curve, and gearing alone converts it to wheel force.
         const ratio = this.gearRatios[this.gear] * this.finalDrive;
-        const torque = this._peakTorque * torqueCurveFactor(rpmRatio);
+        const torque = this.peakTorque() * torqueCurveFactor(rpmRatio);
         let force = torque * ratio * DRIVETRAIN_EFFICIENCY * this.gas / WHEEL_RADIUS;
+        // AI difficulty band (see constructor note). Neutral in every other
+        // code path — player cars, ghosts and MP replicas carry 1.
+        force *= this.torqueMult;
 
         // Turbo lag / cam overlap: the launch band makes less torque than
         // the peak numbers suggest (blended out by 0.4 x redline).
@@ -193,13 +289,16 @@ class Car {
         // Launch tuning (existing behaviour): launch bias adds low-speed muscle
         if (this.speed < 18) force *= this.launchTorqueMultiplier;
 
+        // Staged-rpm launch payout (see judgeLaunch): the clutch dump pays.
+        if (this._launchTimer > 0) force *= 1 + LAUNCH_FORCE_BONUS * this._launchQuality;
+
         // Nitrous injection: a flat power multiplier while the bottle sprays
         if (this.nosSpraying) force *= NOS_POWER_MULT;
 
         // Rev limiter fade near redline (existing behaviour)
         if (rpmRatio > 0.95) force *= Math.max(0, (1 - rpmRatio) * 20);
 
-        const maxTraction = this.weight * G * Math.max(0.45, this.grip + this.launchGripBonus) * 0.7;
+        const maxTraction = this.maxTraction();
         return Math.min(force, maxTraction);
     }
 
@@ -215,6 +314,9 @@ class Car {
             this.shiftTimer -= dt;
             if (this.shiftTimer <= 0) this.shiftTimer = 0;
         }
+
+        // Launch window countdown (opened by judgeLaunch at the line).
+        if (this._launchTimer > 0) this._launchTimer = Math.max(0, this._launchTimer - dt);
 
         if (this._shiftBonusTimer > 0) {
             this._shiftBonusTimer -= dt;
@@ -289,10 +391,17 @@ class Car {
                 engineForce *= (1 + this._shiftBonus);
             }
 
-            const maxTraction = this.weight * G * this.grip * 0.7;
+            // Same accessor the force cap uses — see maxTraction().
+            const maxTraction = this.maxTraction();
             let effectiveForce = engineForce;
             if (engineForce >= maxTraction * 0.95) {
-                effectiveForce = maxTraction * 0.75;
+                // Spinning bleeds traction — but a well-staged launch HOOKS:
+                // the cut shrinks to nothing as launch quality rises
+                // (judgeLaunch), so a brave rev at the line is never punished.
+                const kept = (this._launchTimer > 0)
+                    ? LAUNCH_SPIN_KEPT + (1 - LAUNCH_SPIN_KEPT) * this._launchQuality
+                    : LAUNCH_SPIN_KEPT;
+                effectiveForce = maxTraction * kept;
                 this.wheelSlip = 1.0;
             } else {
                 this.wheelSlip = 0;
@@ -374,6 +483,17 @@ class Car {
             return;
         }
 
+        /* ─── N → 1st under green = THE LAUNCH ─────────────────────────
+           Judged by the staged rev (judgeLaunch), never by the shift
+           windows: scoring the single most important input of the run as
+           an "EARLY SHIFT" slammed everything you staged straight to ~0. */
+        if (this.gear === 0) {
+            this.gear = 1;
+            this.judgeLaunch();
+            if (typeof game !== 'undefined') game.createBackfire(this);
+            return;
+        }
+
         const rpmBefore = this.rpm;
         const redline = this.redline;
         const perfectLow = redline * SHIFT_PERFECT_LOW;
@@ -424,6 +544,9 @@ class Car {
             if (quality === 'perfect') {
                 game.screenShake = 5;
                 game.showNotification('PERFECT SHIFT!');
+                // Ledger tick — counter only; persistence piggybacks on the
+                // race-end save (see career.js).
+                if (typeof Career !== 'undefined' && Career.countPerfect) Career.countPerfect();
             } else if (quality === 'good') {
                 game.screenShake = 2;
                 game.showNotification('GOOD SHIFT');

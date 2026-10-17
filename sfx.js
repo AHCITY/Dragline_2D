@@ -1,6 +1,6 @@
 'use strict';
 
-/* ─── Pixel Drag Legends — Procedural SFX (Web Audio, zero assets) ──────
+/* ─── Redline 2D — Procedural SFX (Web Audio, zero assets) ─────────────
  *
  * Everything is synthesized in the browser: no audio files, nothing to
  * download, nothing copyrighted. Two layers:
@@ -27,6 +27,7 @@ const SFX = {
     _eng: null,
     _ready: false,
     _lastBrake: 0,
+    _lastSpin: 0,
     MUTE_KEY: 'pdl_sfx_muted',
     VOL_KEY: 'pdl_sfx_vol',         // master (sound) volume 0..1, persisted
     MUSIC_VOL_KEY: 'pdl_music_vol', // music bus volume 0..1, persisted
@@ -146,6 +147,11 @@ const SFX = {
         const harm = ctx.createGain();
         harm.gain.value = 0.1;
 
+        // Pre-saturation drive — setEngineVoice() rides this per car so a
+        // big-banger and a flat-four don't share a distortion character.
+        const drive = ctx.createGain();
+        drive.gain.value = 1.4;
+
         // Harmonic bank: sub firing pulse, fundamental, 2nd harmonic.
         const oscs = [];
         [[0.5, 0.34], [1, 0.5], [2, 0.22]].forEach(([mult, g]) => {
@@ -158,7 +164,7 @@ const SFX = {
             o.connect(og);
             og.connect(harm);
             o.start();
-            oscs.push({ o, mult });
+            oscs.push({ o, mult, og });
         });
 
         // Intake/exhaust rush: looping white noise through a bandpass that
@@ -180,7 +186,8 @@ const SFX = {
         ng.connect(harm);
         noise.start();
 
-        harm.connect(shaper);
+        harm.connect(drive);
+        drive.connect(shaper);
         shaper.connect(lp);
         lp.connect(out);
         out.connect(this.master);
@@ -244,9 +251,82 @@ const SFX = {
         nGain.connect(this.master);
         nSrc.start();
 
-        this._eng = { oscs, harm, ng, nbp, lp, out, lfoGain, tGain, tOsc, tBp, nGain, nBp };
+        // Road/wind: the same noise buffer through a mid band-pass, gated by
+        // speed. Sits under everything — it is the "outside the car" layer
+        // that makes the engine feel like it's in a place rather than a void.
+        const rSrc = ctx.createBufferSource();
+        rSrc.buffer = nbuf;
+        rSrc.loop = true;
+        const rBp = ctx.createBiquadFilter();
+        rBp.type = 'bandpass';
+        rBp.frequency.value = 420;
+        rBp.Q.value = 0.6;
+        const rGain = ctx.createGain();
+        rGain.gain.value = 0;
+        rSrc.connect(rBp);
+        rBp.connect(rGain);
+        rGain.connect(this.master);
+        rSrc.start();
+
+        this._eng = { oscs, harm, drive, ng, nbp, lp, out, lfo, lfoGain, tGain, tOsc, tBp, nGain, nBp, rGain, rBp };
         this._boost = 0;
         this._nosWas = false;
+        this._voiceKey = '';
+    },
+
+    /* ── Per-car engine character ─────────────────────────────────────
+       Every car has always shared one voice: same harmonic weights, same
+       drive, same idle wobble — only the firing RATE differed. That makes
+       a V8 and a rotary sound like the same engine played at two pitches.
+
+       This derives a fixed character from the car's own stats (cylinder
+       count, redline, whether it is turbo'd) and crossfades to it whenever
+       the player swaps cars. It is deliberately CONSERVATIVE: every value
+       stays inside a narrow band around the existing defaults, so this can
+       only shade the timbre — it cannot turn a car into a different or
+       unrecognisable engine, and it never touches pitch or volume. */
+    _voiceFor(car) {
+        const cyl = Math.max(1, car.cyl || 4);
+        const red = car.redline || 7000;
+        const turbo = Math.max(0, Math.min(3, car.turbo || 0));
+        // More cylinders = more upper harmonics, less sub weight. A rotary
+        // (2cyl) leans the opposite way, which is the right direction for it.
+        const heat = Math.max(0, Math.min(1, (cyl - 2) / 8));
+        return {
+            // Saturation: big multi-cylinder engines compress and grit harder.
+            drive: 1.15 + 0.75 * heat + 0.10 * turbo,
+            // Harmonic balance — sub thins out as cylinders rise.
+            sub: 0.40 - 0.16 * heat,
+            fund: 0.44 + 0.06 * heat,
+            upper: 0.14 + 0.20 * heat,
+            // Idle wobble: cross-plane V8s (even cyl count) shake harder.
+            lopeHz: cyl % 2 === 0 ? 2.4 + 0.5 * heat : 3.0 + 0.9 * heat,
+            lopeAmt: 0.030 + 0.035 * (cyl % 2 === 0 ? 1 : 0.45),
+            // Filter openness: peaky rev-limits stay brighter, long-revving
+            // diesels sit darker.
+            openHz: 2400 + 900 * heat + Math.min(700, (red - 6000) * 0.35),
+        };
+    },
+
+    setEngineVoice(car) {
+        if (!this._ready || !this._eng || !car) return;
+        const key = [car.name, car.cyl, car.redline, car.turbo].join('|');
+        if (key === this._voiceKey) return;   // unchanged car: no re-skinning
+        this._voiceKey = key;
+        const e = this._eng;
+        const v = this._voiceFor(car);
+        const t = this.ctx.currentTime;
+        try {
+            e.drive.gain.setTargetAtTime(v.drive, t, 0.25);
+            const weights = [v.sub, v.fund, v.upper];
+            e.oscs.forEach((oo, i) => {
+                if (oo.og) oo.og.gain.setTargetAtTime(weights[i], t, 0.25);
+            });
+            e.lfo.frequency.setTargetAtTime(v.lopeHz, t, 0.25);
+            e.lp.frequency.setTargetAtTime(v.openHz, t, 0.3);
+            e._openHz = v.openHz;
+            e._lopeAmt = v.lopeAmt;
+        } catch (err) { /* audio graph not ready — keep the previous voice */ }
     },
 
     // Called every frame from game.loop with the player's car.
@@ -254,6 +334,7 @@ const SFX = {
         if (!this._ready || !this._eng || !car) return;
         const t = this.ctx.currentTime;
         const e = this._eng;
+        this.setEngineVoice(car);
         const red = car.redline || 7000;
         const rn = Math.max(0, Math.min(1.02, car.rpm / red));
         const thr = car.gas > 0.05 ? 1 : 0;
@@ -264,13 +345,32 @@ const SFX = {
         e.nbp.frequency.setTargetAtTime(Math.min(Math.max(f * 1.7, 200), 5200), t, 0.05);
         e.harm.gain.setTargetAtTime(0.10 + 0.24 * thr + 0.10 * rn, t, 0.06);
         e.ng.gain.setTargetAtTime(0.05 * thr + 0.04 * rn, t, 0.08);
-        e.lp.frequency.setTargetAtTime(280 + 2100 * thr + 1700 * rn, t, 0.06);
+        // Filter cutoff rides throttle + revs, scaled by this car's own
+        // openness ceiling so a per-car voice actually changes the tone.
+        const open = e._openHz || 2400;
+        e.lp.frequency.setTargetAtTime((280 + 2100 * thr + 1700 * rn) * (open / 2400), t, 0.06);
         const vol = active ? (0.14 + 0.16 * thr + 0.08 * rn) : 0;
         e.out.gain.setTargetAtTime(vol, t, 0.09);
-        const lope = (active && rn < 0.18) ? 0.05 * (1 - rn / 0.18) : 0;
+        const lopeAmt = (e._lopeAmt === undefined ? 0.05 : e._lopeAmt);
+        const lope = (active && rn < 0.18) ? lopeAmt * (1 - rn / 0.18) : 0;
         e.lfoGain.gain.setTargetAtTime(lope, t, 0.1);
         this._updateTurbo(car, active, t);
         this._updateNos(car, active, t);
+        this._updateRoad(car, active, t);
+    },
+
+    // Road / wind layer: rises only with real road speed, so standing still
+    // is quiet and a long pull gets loud and airy. Uses the player's actual
+    // speed rather than rpm, which is what wind noise physically tracks.
+    // Speed is m/s (MPS_TO_MPH is applied at display time), so a top-end
+    // drag pass sits around 60-70 m/s and the curve is squared to keep the
+    // layer inaudible during the launch, where the engine does the talking.
+    _updateRoad(car, active, t) {
+        const e = this._eng;
+        if (!e.rGain) return;
+        const v = active ? Math.max(0, Math.min(1, (car.speed || 0) / 65)) : 0;
+        e.rBp.frequency.setTargetAtTime(420 + 1500 * v, t, 0.12);
+        e.rGain.gain.setTargetAtTime(0.055 * v * v, t, 0.14);
     },
 
     // Nitrous spray layer: hiss level/brightness follow the ACTUAL spray
@@ -375,7 +475,9 @@ const SFX = {
         const o = ctx.createOscillator();
         o.type = type;
         o.frequency.setValueAtTime(Math.max(20, f0), t);
-        if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+        // Guard the sweep: a caller passing f1=0 (or a negative) must not get
+        // a ramp down to 20 Hz, which is an audible click/thump, not a tone.
+        if (f1 > 0 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
         const g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, t);
         g.gain.exponentialRampToValueAtTime(vol, t + 0.006);
@@ -507,6 +609,89 @@ const SFX = {
         this._blip('sine', 880, 880, 0.09, 0.09);
         this._blip('sine', 1175, 1175, 0.11, 0.09, 0.1);
     },
+
+    /* ── Additional cues ────────────────────────────────────────────
+       Added variety without touching anything above. All of these are new
+       entry points — no existing call site changes behaviour. */
+
+    // Refusal / invalid action: a short descending buzz. Deliberately NOT
+    // a harsh square — it should read as "no" without startling you.
+    error() {
+        if (!this._ready) return;
+        this._blip('sawtooth', 300, 190, 0.13, 0.09);
+        this._blip('square', 200, 150, 0.12, 0.05, 0.05);
+    },
+
+    // Confirmation: a clean two-step lift, the counterpart to error().
+    success() {
+        if (!this._ready) return;
+        this._blip('square', 660, 660, 0.07, 0.09);
+        this._blip('square', 990, 990, 0.13, 0.09, 0.06);
+    },
+
+    // Purchase: coin-flavoured, brighter and shorter than finish(), with a
+    // little ring on top so spending money feels different from earning it.
+    purchase() {
+        if (!this._ready) return;
+        this._blip('square', 1047, 1568, 0.10, 0.10);
+        this._blip('square', 1568, 2093, 0.11, 0.08, 0.08);
+        this._blip('sine', 3136, 3136, 0.16, 0.035, 0.14);
+    },
+
+    // New personal best / trophy unlocked — a rising major arpeggio, clearly
+    // grander than success() so the two never get confused.
+    fanfare() {
+        if (!this._ready) return;
+        [523, 659, 784, 1047, 1319].forEach((f, i) => {
+            this._blip('square', f, f, i === 4 ? 0.42 : 0.10, 0.12, i * 0.085);
+        });
+        this._blip('sine', 1047, 1047, 0.4, 0.04, 0.42);
+    },
+
+    // Countdown anticipation — a rising tick per light, so the tree builds
+    // tension instead of just repeating the same beep.
+    treeStep(step) {
+        if (!this._ready) return;
+        const n = Math.max(1, Math.min(4, step || 1));
+        this._blip('square', 330 * Math.pow(1.19, n - 1), 0, 0.10, 0.18);
+    },
+
+    // Lightweight hover/tick for keyboard menu traversal. Very quiet — it
+    // fires on every arrow key, so it must not fatigue.
+    tick() {
+        if (!this._ready) return;
+        this._blip('square', 1900, 1900, 0.018, 0.035);
+    },
+
+    // Incoming friend request / race invite — three urgent blips so it cuts
+    // through engine noise the way notify() (two soft sine tones) cannot.
+    alert() {
+        if (!this._ready) return;
+        [0, 0.09, 0.18].forEach((w, i) => this._blip('square', 1047, 1319, 0.08, 0.10, w));
+        this._blip('sine', 2093, 2093, 0.14, 0.05, 0.26);
+    },
+
+    // Nitrous bottle empties mid-run: a hollow sputter rather than a beep.
+    nosEmpty() {
+        if (!this._ready) return;
+        this._noise(0.30, 0.09, 'bandpass', 2400, 700, 2.5);
+        this._blip('sine', 420, 120, 0.22, 0.07, 0.05);
+    },
+
+    // Tire scrub when the rears light up but the car isn't actually moving
+    // (wheelspin off the line). Distinct from brake() screech.
+    wheelspin(intensity) {
+        if (!this._ready) return;
+        const now = performance.now();
+        if (now - this._lastSpin < 150) return;
+        this._lastSpin = now;
+        const v = 0.03 + Math.min(0.09, (intensity || 0) * 0.09);
+        this._noise(0.16, v, 'bandpass', 1500, 1100, 4);
+    },
+
+    // Opponent connected / disconnected in multiplayer.
+    peerJoin() { if (this._ready) { this._blip('sine', 523, 784, 0.13, 0.08); } },
+    peerLeft() { if (this._ready) { this._blip('sine', 784, 440, 0.18, 0.08); } },
 
     /* ── Music: procedural chiptune loops (zero assets, original tunes) ──
        Two short loops rendered ONCE into AudioBuffers with an

@@ -122,6 +122,83 @@ function rimPaintColor(car, fallback) {
 }
 window.CUSTOMIZATION = CUSTOMIZATION; // Expose for Car.js
 
+/* ─── Save-file sanitizing ───
+   Everything below runs on data that came from IndexedDB / localStorage /
+   a URL param. That data is under the player's own control, so it is treated
+   as UNTRUSTED INPUT, not as truth: it may be hand-edited, truncated, or
+   written by an older build whose shape differs. Nothing here is a security
+   boundary against a determined local editor — a player with devtools can edit
+   memory directly — but it does mean a corrupt or stale save degrades to a
+   playable, sane state instead of a NaN speed or an unreachable car. */
+
+// Money: finite, non-negative, whole dollars. Never NaN, never -1, never 1e308.
+function sanitizeCash(v, fallback = 2500) {
+    const n = Number(v);
+    if (!isFinite(n) || n < 0) return fallback;
+    return Math.min(Math.floor(n), 999999999);
+}
+
+// A recorded time (best ET, ghost). Must be a plausible positive duration.
+function sanitizeTime(v) {
+    const n = Number(v);
+    // REJECT, not clamp: the old Math.min(n, 600) turned garbage sentinels
+    // (a 999 DNF that leaked into old saves) into a plausible-looking
+    // "600.000s" personal best on the menu. Over ten minutes is not a
+    // drag race — such a value is corruption, so it becomes "no record".
+    if (!isFinite(n) || n <= 0 || n >= 600) return null;
+    return n;
+}
+
+// Upgrade levels. Booleans mean "stage 1" (legacy saves); numbers are clamped
+// to each part's real range so a hand-edited save cannot buy stage 99 of NOS.
+function sanitizeUpgrades(saved) {
+    const src = (saved && typeof saved === 'object') ? saved : {};
+    const stage = (v, max) => {
+        if (v === true) return 1;
+        if (v === false || v == null) return 0;
+        const n = Math.round(Number(v));
+        return isFinite(n) ? Math.max(0, Math.min(max, n)) : 0;
+    };
+    return {
+        engine: Math.max(1, stage(src.engine, 5)),
+        injector: Math.max(1, stage(src.injector, 5)),
+        chassis: Math.max(1, stage(src.chassis, 5)),
+        shortGears: Math.max(1, stage(src.shortGears, 5)),
+        intercooler: stage(src.intercooler, 2),
+        camshaft: stage(src.camshaft, 3),
+        slicks: !!src.slicks,
+        aero: !!src.aero,
+        parachute: !!src.parachute,
+        performanceGearbox: !!src.performanceGearbox,
+        swapped: !!src.swapped,
+        // Racing Clutch is a real purchasable part (PERFORMANCE menu, $1600)
+        // with a live effect in Car._fastShifter. It MUST be listed here or
+        // the whitelist silently deletes it on load and the player is charged
+        // for an upgrade that vanishes on the next page refresh.
+        racingClutch: !!src.racingClutch,
+        turbo: stage(src.turbo, 3),
+        nos: stage(src.nos, 3),
+    };
+}
+
+// Tuning sliders are deltas around stock; a legacy boolean is ambiguous, so
+// anything unparseable becomes "no adjustment".
+function sanitizeTune(saved) {
+    const src = (saved && typeof saved === 'object') ? saved : {};
+    const d = (v) => {
+        const n = Math.round(Number(v));
+        return isFinite(n) ? Math.max(-3, Math.min(3, n)) : 0;
+    };
+    return {
+        finalDrive: d(src.finalDrive),
+        gearSpacing: d(src.gearSpacing),
+        launch: d(src.launch),
+        aeroTrim: d(src.aeroTrim),
+        ignitionTiming: d(src.ignitionTiming),
+        tirePressure: d(src.tirePressure),
+    };
+}
+
 // Attachment points published by renderer.js each frame. Shared by every
 // part drawer so a part follows whatever silhouette it is fitted to.
 function artAnchor(car, key) { return car._artAnchors?.[key] || { x: 3, y: 27, w: 14 }; }
@@ -136,11 +213,154 @@ function drawLivery(ctx, car, kind) {
     else if (kind === 'number') { ctx.fillStyle = '#fff'; ctx.font = 'bold 12px monospace'; ctx.fillText('7', a.x + a.w * .48, a.y + a.h - 2); }
 }
 
+/* ─── AI Driver: "Driver Persona over Phase FSM" ────────────────────
+   Research-backed opponent model (GameAIPro Ch.38 persona layer +
+   Ch.3 gaussian/filtered randomness + capped physics-layer catch-up):
+
+   • The opponent is a DRIVER, not a hp number. A per-race plan is
+     drawn ONCE from gaussian noise around a difficulty scalar, so a
+     given opponent races a CONSISTENT line instead of flickering
+     strong/weak within a run.
+   • Phase FSM: STAGING (rev to a skill-scaled target) → LAUNCH
+     (human reaction delay, occasional hesitation flub) → SHIFT RUN
+     (per-gear shift points, bounded flubs, occasional limiter ride)
+     with NOS timing on top.
+   • Rubber-band is a smoothed, HARD-CAPPED torqueMult (±4%) applied
+     to the car — never to behaviour — and it is dead during the
+     launch and the final 10% of the strip, so skill decides the
+     finish (GameAIPro/Melder: "AI leads early, loses late").
+   • difficulty d ∈ [0..1]: 0 = clumsy rookie, 1 = pro tree.        */
+class AIDriver {
+    constructor(car, difficulty) {
+        const d = Math.max(0, Math.min(1, +difficulty || 0));
+        this.d = d;
+        this.seed = Math.random() * 100;
+        const gauss = AIDriver.gauss;
+
+        // LAUNCH: human reaction (real-world RT ≈ 0.1–0.5 s), tighter
+        // and faster with skill. Drawn once — consistent for the run.
+        this.reactDelay = Math.max(0.12, Math.min(0.75,
+            gauss(0.44 - 0.28 * d, 0.05 + 0.06 * (1 - d))));
+        // Hesitation flub: low-skill drivers sometimes sleep at the
+        // tree and leak ~0.2–0.4 s — the classic "holeshot win".
+        this.launchFlub = Math.random() < (1 - d) * 0.28;
+        this.flubDelay = 0.15 + Math.random() * 0.22;
+
+        // STAGING: target rev fraction for the hold at the line.
+        // Rookies may over-rev into wheelspin; pros hold a tight hole.
+        this.stageFrac = Math.max(0.3, Math.min(0.88,
+            gauss(0.58 + 0.12 * d, 0.05 + 0.1 * (1 - d))));
+
+        // SHIFT RUN: base shift point walks toward the perfect window
+        // (0.88–0.98 of redline) as skill rises; noise shrinks with it.
+        this.shiftFrac = 0.86 + 0.07 * d;
+        this.shiftSigma = 0.012 + 0.05 * (1 - d);
+        this.flubChance = 0.015 + 0.065 * (1 - d);   // per shift
+        this._flubRun = 0;                            // never 3 flubs straight
+        this.rideLimiter = Math.random() < d * 0.12;  // pros bounce it once, rarely
+
+        // NOS: pro-level bottle discipline — gear-based trigger.
+        this.useNos = car.nos > 0 && Math.random() < 0.4 + 0.55 * d;
+        this.nosGear = Math.random() < 0.75 ? 2 : 3;
+        this.nosDelay = 0.2 + Math.random() * 0.8;
+
+        // FOCUS: slow "in the groove" drift (GameAIPro Ch.3 1-D noise
+        // stand-in) — pace wanders ±1–3% over seconds, never snaps.
+        this.focusAmp = 0.008 + 0.022 * (1 - d);
+        this.focusPeriod = 6 + Math.random() * 8;
+    }
+
+    // Sum-of-3-uniforms gaussian — no deps, bell-shaped, bounded ±1σ·k.
+    static gauss(mu, sigma) {
+        return mu + ((Math.random() + Math.random() + Math.random()) / 1.5 - 1) * sigma;
+    }
+
+    /* STAGING phase (countdown): hold the revs at the planned hole.
+       Same surface the human uses — gas held at the line. */
+    staging(car, dt) {
+        car.clutch = 1; car.gear = 1; car.brake = 0;
+        const target = car.redline * this.stageFrac;
+        const t = performance.now();
+        const wob = Math.sin(t / 170 + this.seed) * 90 + Math.sin(t / 61 + this.seed * 2) * 45;
+        car.rpm += ((target + wob) - car.rpm) * Math.min(1, 7 * dt);
+        if (car.rpm > car.redline) car.rpm = car.redline;
+        if (car.rpm < 1000) car.rpm = 1000;
+        car.gas = car.rpm < target ? 0.9 : 0.3;
+    }
+
+    /* RUNNING phase: launch → shift run. `player` feeds the (capped)
+       catch-up band only. */
+    drive(car, player, dt, game) {
+        if (!car.launched) {
+            const delay = this.reactDelay + (this.launchFlub ? this.flubDelay : 0);
+            if (game.raceTimer < delay) {
+                this.staging(car, dt);   // still holding at the line
+                return;
+            }
+            car.launched = true;
+            car.clutch = 0; car.gas = 1; car.gear = 1;
+            // The AI launches off its staged rev too — skill-scaled (see the
+            // stageFrac plan): weak staging bogs, pro staging hooks. Silent
+            // for AI cars: judgeLaunch only speaks to the player's car.
+            car.judgeLaunch();
+        }
+
+        car.clutch = 0; car.gas = 1;
+        this._shiftRun(car);
+        this._nos(car, game);
+        this._catchup(car, player, dt, game);
+    }
+
+    _shiftRun(car) {
+        if (car.shiftTimer > 0) return;
+        if (car.gear <= 0 || car.gear >= car.gearRatios.length - 1) return;
+        const rl = car.redline;
+        let shiftAt = rl * Math.max(0.7, Math.min(0.99,
+            AIDriver.gauss(this.shiftFrac, this.shiftSigma)));
+        // Filtered randomness (GameAIPro Ch.3): a flub is human, three
+        // flubs in a row reads as broken — cap the streak at two.
+        if (this._flubRun < 2 && Math.random() < this.flubChance) {
+            shiftAt = rl * (0.74 + Math.random() * 0.06);
+            this._flubRun++;
+        } else if (this.rideLimiter && car.gear === Math.min(3, car.gearRatios.length - 2) && Math.random() < 0.25) {
+            shiftAt = rl - 120;   // one deliberate limiter ride (backfire + falloff)
+        } else {
+            this._flubRun = 0;
+        }
+        if (car.rpm >= shiftAt) car.shiftUp();
+    }
+
+    _nos(car, game) {
+        if (!this.useNos) return;
+        if (!car.nosActive && car.nosTank > 0 && car.gear >= this.nosGear &&
+            game.raceTimer >= this.nosDelay) {
+            car.nosActive = true;
+        }
+        if (car.nosTank <= 0) car.nosActive = false;
+    }
+
+    /* Bounded catch-up on the PHYSICS layer (Forza/Melder pattern):
+       gap-driven, smoothed, ±4% hard cap, dead during the launch and
+       the final 10% of the strip. */
+    _catchup(car, player, dt, game) {
+        let target = 1 + this.focusAmp * Math.sin(game.raceTimer / this.focusPeriod + this.seed);
+        if (game.raceTimer > 0.6 && car.x < game.raceDistance * 0.9 && player) {
+            const gap = player.x - car.x;            // + = AI behind
+            if (Math.abs(gap) > 2.5) {
+                const norm = Math.max(-1, Math.min(1, gap / 22));
+                target *= 1 + norm * 0.04;
+            }
+        }
+        target = Math.max(0.955, Math.min(1.045, target));
+        car.torqueMult += (target - car.torqueMult) * Math.min(1, 1.5 * dt);
+    }
+}
+
 const game = {
     canvas: null, ctx: null,
     state: 'MENU', menuState: 'MAIN',
     cash: 2500, ownedCars: [], selectedCarIndex: 0,
-    quickStats: { races: 0, wins: 0, recentMargin: 0 },
+    quickStats: { races: 0, wins: 0, recentMargin: 0, streak: 0 },
     raceDistance: 402,
     lights: 0, lightTimer: 0, raceStartTime: 0, raceTimer: 0,
     raceState: 'STAGING',
@@ -195,6 +415,9 @@ const game = {
     ],
 
     async init() {
+        // BUILD-STAMP: prints the page's declared build so a stale cached
+        // copy is identifiable from the console at a glance.
+        try { console.info('[RLD] build ', (document.querySelector('meta[name="rl-build"]')||{}).content || 'unknown'); } catch (e) {}
         this.canvas = document.getElementById('gameCanvas');
         this.ctx = this.canvas.getContext('2d');
         this.resize();
@@ -212,8 +435,19 @@ const game = {
         // Driver profile loads after the save system (it uses the same
         // IndexedDB pipeline) and before the UI is wired.
         if (typeof Profile !== 'undefined') await Profile.init();
+        // Cloud wallet (E1a) arms once the profile id exists. Fire-and-
+        // forget: boot never waits on the network, and until the wallet
+        // reconciles the game plays exactly as before (local-first).
+        if (typeof Wallet !== 'undefined') Wallet.init();
         if (typeof Friends !== 'undefined') await Friends.init();
+        // Career ledger loads its counters before the UI is wired so the
+        // menu chip and race-end hooks are live from the first frame.
+        if (typeof Career !== 'undefined') await Career.init();
+        // Daily login bonus loads its per-account streak before the menu
+        // UI wires up, so the claim strip is live from the first frame.
+        if (typeof DailyBonus !== 'undefined') await DailyBonus.init();
 
+        this.fxInit();
         this.detectMobile();
         this.setupFullscreenListeners();
 
@@ -224,6 +458,7 @@ const game = {
         }
         this.playerCar = this.ownedCars[this.selectedCarIndex];
         this.effects = new RaceParticles(this.ctx);
+        this._applyFxToEffects();   // fresh particle system adopts the persisted FX level
         this.setupInput();
         // Keyboard operability for the ghost-race menu button (div-onclick
         // pattern used across the menu; Enter/Space mirrored here).
@@ -233,7 +468,7 @@ const game = {
         });
         // Same for the SETTINGS entry + its panel controls (role=button
         // divs never fire click from the keyboard on their own).
-        document.querySelectorAll('#menu-settings-btn, #settings-menu [role="button"]').forEach(el => {
+        document.querySelectorAll('#menu-settings-btn, #settings-menu [role="button"], #career-menu-btn, #career-menu [role="button"], #gar-prev, #gar-next').forEach(el => {
             el.addEventListener('keydown', e => {
                 if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
             });
@@ -281,6 +516,19 @@ const game = {
         };
         const ok = await SaveSystem.save(this.SAVE_KEY, data);
         if (ok) this.flashSave();
+        else {
+            // The write FAILED (quota exhausted, IndexedDB unavailable,
+            // private browsing). Re-arm the dirty flag: clearing it up-front
+            // meant every later scheduleSave() — race payouts, purchases — was
+            // a silent no-op for the rest of the session, so a single failed
+            // write discarded all progress on reload. Retry shortly; if it
+            // keeps failing the next scheduleSave() retries anyway, so this
+            // cannot spin.
+            this._saveDirty = true;
+            this.showNotification('SAVE FAILED - CHECK STORAGE');
+            if (this._saveTimer) clearTimeout(this._saveTimer);
+            this._saveTimer = setTimeout(() => this.flushSave(), 5000);
+        }
     },
 
     async loadGame() {
@@ -288,39 +536,192 @@ const game = {
             const data = await SaveSystem.load(this.SAVE_KEY);
             if (!data) return;
 
-            this.cash = data.cash ?? 2500;
-            this.tournamentRound = data.tournamentRound ?? 1;
-            this.quickStats = { races: 0, wins: 0, recentMargin: 0, ...(data.quickStats || {}) };
-            this.bestET = data.bestET ?? null;
+            this.cash = sanitizeCash(data.cash);
+            this.tournamentRound = Math.max(1, Math.round(Number(data.tournamentRound) || 1));
+            // Clamp exactly like mpStats below: these numbers drive the AI
+            // difficulty ramp (getQuickOpponent reads races/wins), so a
+            // non-numeric value from a hand-edited or older-format save would
+            // otherwise flow straight through and be written back out.
+            const qs = (data.quickStats && typeof data.quickStats === 'object') ? data.quickStats : {};
+            this.quickStats = {
+                races: Math.max(0, Math.round(Number(qs.races) || 0)),
+                wins: Math.max(0, Math.round(Number(qs.wins) || 0)),
+                recentMargin: Number.isFinite(Number(qs.recentMargin)) ? Number(qs.recentMargin) : 0,
+                // Win/loss streak feeds the dynamic difficulty rubber-band
+                // (see getQuickOpponent). Clamped like every other stat so
+                // a hand-edited save can't pin the matchmaker.
+                streak: Math.max(-99, Math.min(99, Math.round(Number(qs.streak) || 0))),
+            };
+            this.bestET = sanitizeTime(data.bestET);
             this.ghostRun = this._sanitizeGhostRun(data.ghost);
             this.currentBackground = data.currentBackground ?? 0;
             this.mpStats = { races: 0, wins: 0, losses: 0, bestET: null, ...(data.mpStats || {}) };
-            if (this.currentBackground >= this.backgrounds.length) this.currentBackground = 0;
+            this.mpStats.races = Math.max(0, Number(this.mpStats.races) || 0);
+            this.mpStats.wins = Math.max(0, Number(this.mpStats.wins) || 0);
+            this.mpStats.losses = Math.max(0, Number(this.mpStats.losses) || 0);
+            this.mpStats.bestET = sanitizeTime(this.mpStats.bestET);
+            if (!(this.currentBackground >= 0 && this.currentBackground < this.backgrounds.length)) this.currentBackground = 0;
 
-            this.ownedCars = (data.ownedCars || []).map(cd => {
-                const def = {
-                    name: cd.name, hp: cd.baseHp, weight: cd.baseWeight,
-                    grip: cd.baseGrip, redline: cd.baseRedline, price: cd.price,
-                    color: cd.color, secondaryColor: cd.secondaryColor, type: cd.type,
-                    art: cd.art || this.carDefs.find(def => def.name === cd.name)?.art || cd.type,
-                    gearRatios: cd.baseGearRatios, finalDrive: cd.baseFinalDrive,
-                    dragArea: cd.baseDragArea, tune: cd.tune,
-                };
+            // OWNERSHIP IS RE-DERIVED FROM THE CATALOG. The save file may only
+            // say WHICH cars this player owns — every performance number (hp,
+            // weight, gearing, drag, price, colour) is read from carDefs, and a
+            // saved entry naming a car the catalog does not contain is dropped.
+            //
+            // Before this, a saved entry carried its own hp/weight/gearing, so a
+            // hand-edited IndexedDB record could hand the player a 50,000 hp
+            // dragster. Upgrades and customization are still restored from the
+            // save, because those ARE the player's purchases — they just pass
+            // through sanitizeUpgrades() first.
+            const savedCars = Array.isArray(data.ownedCars) ? data.ownedCars : [];
+            const seen = new Set();
+            this.ownedCars = savedCars.map(cd => {
+                if (!cd || typeof cd.name !== 'string') return null;
+                const def = this.carDefs.find(d => d.name === cd.name);
+                if (!def) return null;              // catalog drift or an invented car
+                if (seen.has(def.name)) return null; // a duplicate entry grants nothing
+                seen.add(def.name);
                 const car = new Car(def);
-                car.upgrades = cd.upgrades || car.upgrades;
+                // Restore the paint the player actually paid for in the
+                // garage. `new Car(def)` always starts on the factory
+                // colours, and flushSave writes color/secondaryColor on
+                // every save — without this the loader drops them and every
+                // repaint silently reverts on reload (as does rimPaint,
+                // which resolves from secondaryColor).
+                if (typeof cd.color === 'string' && /^#[0-9a-f]{3,8}$/i.test(cd.color)) {
+                    car.color = cd.color;
+                }
+                if (typeof cd.secondaryColor === 'string' && /^#[0-9a-f]{3,8}$/i.test(cd.secondaryColor)) {
+                    car.secondaryColor = cd.secondaryColor;
+                }
+                car.upgrades = sanitizeUpgrades(cd.upgrades);
+                car.tune = sanitizeTune(cd.tune);
                 // Saved customization IDs are re-hydrated into drawable catalog
                 // entries. Old saves without customization fall back to stock.
                 car.customization = cd.customization ? hydrateCustomization(cd.customization) : car._stockCustomization();
                 car.applyUpgrades();
                 return car;
-            });
-            this.selectedCarIndex = Math.min(data.selectedCarIndex ?? 0, Math.max(0, this.ownedCars.length - 1));
+            }).filter(Boolean);
+            this.selectedCarIndex = Math.max(0, Math.min(
+                Math.round(Number(data.selectedCarIndex) || 0),
+                Math.max(0, this.ownedCars.length - 1)));
         } catch (e) {
             console.warn('Load failed, starting fresh:', e);
             this.cash = 2500;
             this.tournamentRound = 1;
             this.ownedCars = [];
         }
+    },
+
+    /* ── Money ────────────────────────────────────────────────────────────
+       Every cash movement in the game goes through these two. They exist so
+       a bad value can never become a broken save: NaN cash propagates into
+       every comparison and renders as "NaN" on every screen, and a negative
+       or negative-priced purchase is a straight exploit.
+
+       They validate the AMOUNT, and since the cloud wallet (wallet.js, E1a)
+       every ACCEPTED move is also mirrored to pdl_wallet as one atomic RTDB
+       transaction whose math the security rules re-derive from the server's
+       pre-write state — head+1, balance+d, bounded deltas, a rolling earn
+       window and an append-only journal. A devtools poke of this.cash no
+       longer survives a reload: it never produces a wallet move, so the
+       boot reconcile adopts the server balance over the tampered local one.
+       The mirror is fire-and-forget — offline play is unchanged. */
+    awardCash(amount, reason) {
+        const n = Math.round(Number(amount));
+        // A prize that isn't a sane whole number of dollars is a bug upstream,
+        // not something to bank. Refuse rather than corrupt the save.
+        if (!isFinite(n) || n <= 0) {
+            console.warn('awardCash refused', reason, amount);
+            return 0;
+        }
+        const before = this.cash;
+        this.cash = sanitizeCash(before + n);
+        console.log('awardCash +' + (this.cash - before), reason || '');
+        // Mirror the accepted gain to the cloud wallet (atomic, rules-
+        // validated; no-ops when offline/signed-out). Queued, never awaited.
+        const gained = this.cash - before;
+        if (gained > 0 && typeof Wallet !== 'undefined') Wallet.move(gained, reason || 'unknown');
+        // Cash just moved — the ledger's cash-peak goal is re-checked here
+        // (and in spendCash) so POCKET MONEY unlocks without waiting for
+        // the next race-end evaluation.
+        if (typeof Career !== 'undefined' && Career.evaluate) Career.evaluate();
+        return gained;
+    },
+
+    // `allowZero` exists for purchases that legitimately cost nothing (the
+    // starter car). A price that is negative, NaN or non-numeric is never
+    // "free" — it is inverted, which would PAY the player to buy something.
+    canAfford(cost, allowZero = true) {
+        const n = Number(cost);
+        if (!isFinite(n)) return false;
+        if (n < 0) return false;
+        if (n === 0) return !!allowZero;
+        return this.cash >= n;
+    },
+
+    spendCash(cost, reason) {
+        const n = Number(cost);
+        if (!isFinite(n) || n < 0) {
+            console.warn('spendCash refused', reason, cost);
+            return false;
+        }
+        if (this.cash < n) {
+            console.warn('spendCash refused — insufficient funds', reason, cost, this.cash);
+            return false;
+        }
+        this.cash = sanitizeCash(this.cash - n);
+        // Mirror the accepted spend (atomic, rules-validated; no-ops when
+        // offline/signed-out). Queued, never awaited.
+        if (n > 0 && typeof Wallet !== 'undefined') Wallet.move(-n, reason || 'unknown');
+        // Purchases (cars/parts) change garage size and wallet — the same
+        // live re-check as awardCash so COLLECTOR / FULL GARAGE unlock
+        // the moment the car lands in the garage.
+        if (typeof Career !== 'undefined' && Career.evaluate) Career.evaluate();
+        return true;
+    },
+
+    /* Re-asserts that the ACTIVE car is one this save legitimately owns.
+       Called before any moment where the car leaves the local machine and
+       becomes a promise to someone else:
+         · announcing a loadout for a multiplayer heat,
+         · starting (or re-starting) a heat from a saved pairing.
+
+       Both the car name and its identity are checked against ownedCars — a
+       stale object reference (one left over from a previous session, or from
+       a shop screen that swapped the array underneath us) is repaired here
+       rather than being announced as a car the player may not own.
+
+       `announce` adds a player-facing note, because this path is normally
+       reached through a rematch or a lobby and silently swapping the car
+       would otherwise look like the game forgot what you had selected.
+       Returns the car now considered valid. */
+    ensureOwnedCar(announce = false) {
+        const owned = this.ownedCars;
+        let car = this.playerCar;
+        const isOwned = c => !!c && owned.indexOf(c) !== -1;
+
+        if (!owned.length) {
+            // Nothing owned at all (corrupt save, or a race that deleted the
+            // array): the starter car is free and always defensible.
+            const starter = new Car(this.carDefs[0]);
+            owned.push(starter);
+            this.selectedCarIndex = 0;
+            car = starter;
+            this.scheduleSave();
+        } else if (!isOwned(car)) {
+            // Player's selection no longer resolves to an owned car. Fall back
+            // to the first car this player genuinely owns.
+            const idx = Math.max(0, Math.min(this.selectedCarIndex | 0, owned.length - 1));
+            car = owned[idx];
+            if (announce) {
+                this.showNotification('CAR RESET — USING ' + String(car.name).toUpperCase());
+            }
+            console.warn('ensureOwnedCar: selection did not resolve to an owned car; fell back to', car.name);
+        }
+
+        this.playerCar = car;
+        this.selectedCarIndex = owned.indexOf(car);
+        return car;
     },
 
     flashSave() {
@@ -529,13 +930,19 @@ const game = {
 
         window.addEventListener('keydown', e => {
             if (e.repeat) return;
+            // Auth gate owns the keyboard while the sign-in overlay is up
+            // (prevents Escape→pause and gas/brake hotkeys leaking in
+            // from the auth email/password fields).
+            if (window.RLAuth && RLAuth.isLocked()) return;
             const k = e.key.toLowerCase();
             if (k === 'escape') {
                 if (this.state === 'MENU' && this.closeSettingsIfOpen()) return;
                 this.togglePause();
                 return;
             }
-            if (k === 'm') { this.toggleSound(); return; }
+            // NOTE: no 'm' mute hotkey — M sits right beside the shift keys, so
+            // a missed keypress during a race silently killed ALL audio mid-run.
+            // Sound/music stay toggleable from the pause + settings panels only.
             if (this.paused) return;
             if (k === 'w' || k === 'arrowup') handle('gas', 1);
             if (k === 's' || k === 'arrowdown') handle('brake', 1);
@@ -546,6 +953,12 @@ const game = {
             }
             if (k === 'a' || k === 'arrowleft') {
                 if (this.state === 'RACE') { this.playerShiftDown(); this._pulseBtn('btn-down'); }
+            }
+            // Garage browsing: ←/→ walk the owned cars while MY GARAGE is
+            // open (menu state only — in a race the same keys shift gears).
+            if (this.state === 'MENU' && this.menuState === 'GARAGE') {
+                if (k === 'arrowleft') { e.preventDefault(); this.garageNavigate(-1); }
+                if (k === 'arrowright') { e.preventDefault(); this.garageNavigate(1); }
             }
         });
 
@@ -697,6 +1110,7 @@ const game = {
         menu.classList.remove('hidden');
         this._refreshSoundLabel();
         this._refreshMusicLabel();
+        this._refreshFxLabel();
         this._refreshVolumeSliders();
     },
 
@@ -728,6 +1142,98 @@ const game = {
         const muted = SFX.toggleMusicMuted();
         this._refreshMusicLabel();
         this.showNotification(muted ? 'MUSIC OFF' : 'MUSIC ON');
+    },
+
+    // ── FX quality system (High / Low / Auto) ───────────────────────
+    // One setting, three states, stored in the existing 'rla_fx' key:
+    //   '0'    High FX — every effect, zero adaptation (the default).
+    //   '1'    Low FX  — deliberate medium reductions, fixed.
+    //   'auto' — the monitor adapts tiers 0..3 to sustained FPS.
+    // Adaptation touches OPTIONAL visuals only (particle rates, soft
+    // glows); physics, input, collision and rules are never touched,
+    // and manual selections are always respected.
+    _fxMode: '0',
+    _fxTier: 0,          // auto-mode only: 0 full … 3 minimal
+    _fpsBuf: [],
+    _fxEvalT: 0,
+    _fxLowStreak: 0,
+    _fxGoodStreak: 0,
+    _fxCooldown: 0,
+
+    fxInit() {
+        let v = '0';
+        try { v = localStorage.getItem('rla_fx') || '0'; } catch (e) {}
+        if (v !== '0' && v !== '1' && v !== 'auto') v = '0';
+        this._fxMode = v;
+        this._applyFxToEffects();
+    },
+
+    /* 0 full · 1-3 adaptive tiers · manual Low FX sits at tier 2 */
+    fxLevel() {
+        if (this._fxMode === '1') return 2;
+        if (this._fxMode === 'auto') return this._fxTier;
+        return 0;
+    },
+
+    _applyFxToEffects() {
+        if (this.effects && this.effects.setFxLevel) this.effects.setFxLevel(this.fxLevel());
+    },
+
+    /* Rolling frame-time monitor. Evaluates once per second over a 2 s
+     * window; three consecutive slow evaluations step the tier down,
+     * eight fast ones step it back up, with a 10 s cooldown after any
+     * change so quality never oscillates mid-race. Auto mode only, and
+     * only while actually racing (menu frames are not evidence). */
+    _fxMonitor(realDt) {
+        this._fpsBuf.push(realDt);
+        if (this._fpsBuf.length > 120) this._fpsBuf.shift();
+        this._fxEvalT += realDt;
+        if (this._fxEvalT < 1) return;
+        this._fxEvalT = 0;
+        const buf = this._fpsBuf;
+        const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
+        buf.length = 0;
+        if (this._fxMode !== 'auto' || this.state !== 'RACE' || this.paused) return;
+        if (this._fxCooldown > 0) { this._fxCooldown--; return; }
+        const fps = 1 / Math.max(avg, 1e-4);
+        if (fps < 27) { this._fxLowStreak++; this._fxGoodStreak = 0; }
+        else if (fps > 47) { this._fxGoodStreak++; this._fxLowStreak = 0; }
+        else { this._fxLowStreak = 0; this._fxGoodStreak = 0; }
+        if (this._fxLowStreak >= 3 && this._fxTier < 3) {
+            this._fxTier++;
+            this._fxLowStreak = 0;
+            this._fxCooldown = 10;
+            this._applyFxToEffects();
+            this.showNotification('FX AUTO: ' + ['FULL', 'LIGHT', 'MEDIUM', 'MINIMAL'][this._fxTier]);
+        } else if (this._fxGoodStreak >= 8 && this._fxTier > 0) {
+            this._fxTier--;
+            this._fxGoodStreak = 0;
+            this._fxCooldown = 10;
+            this._applyFxToEffects();
+        }
+    },
+
+    // ── Reduced-FX toggle (settings) ────────────────────────────────
+    // Accessibility switch for drivers on low-end phones or motion-
+    // sensitive eyes: kills every decorative animation/transition via the
+    // html.reduce-motion class (see style.css). Persisted locally; applied
+    // pre-paint by the head boot script so the very first frame already
+    // respects the driver's choice.
+    toggleReduceFx() {
+        const order = ['0', 'auto', '1'];
+        const next = order[(order.indexOf(this._fxMode) + 1) % order.length];
+        this._fxMode = next;
+        if (next === '1') this._fxTier = 2;   // leaving AUTO: start Low FX at its fixed tier
+        try { localStorage.setItem('rla_fx', next); } catch (e) {}
+        document.documentElement.classList.toggle('reduce-motion', next === '1');
+        this._applyFxToEffects();
+        this._refreshFxLabel();
+        this.showNotification(next === '0' ? 'FULL FX ON' : (next === 'auto' ? 'FX AUTO-ADAPT ON' : 'LOW FX ON'));
+    },
+
+    _refreshFxLabel() {
+        const btn = document.getElementById('set-fx-btn');
+        if (btn) btn.innerText = 'REDUCE FX: ' + ({ '0': 'OFF', 'auto': 'AUTO', '1': 'ON' }[this._fxMode] || 'OFF');
     },
 
     _refreshSoundLabel() {
@@ -848,9 +1354,12 @@ const game = {
     },
 
     loop(timestamp) {
-        requestAnimationFrame(t => this.loop(t));
+        // Bound once: a fresh arrow closure here was one allocation
+        // per frame for the GC to collect, forever.
+        requestAnimationFrame(this._boundLoop || (this._boundLoop = this.loop.bind(this)));
         const realDt = (timestamp - this.lastTimestamp) / 1000;
         this.lastTimestamp = timestamp;
+        this._fxMonitor(realDt);   // rolling frame stats; adapts OPTIONAL FX only
 
         if (this.paused) {
             // Even while the sim is frozen the frame must not leave stale
@@ -901,6 +1410,10 @@ const game = {
 
         // Nitrous HUD (bottle gauge + button visibility).
         if (this.state === 'RACE') this._updateNosHud();
+        // Refresh the guest's clock calibration during a live race. Runs off
+        // the render loop (not the fixed step) so it keeps working while the
+        // physics is paused, and is a no-op in every other state.
+        if (typeof MP !== 'undefined') MP.maybeResyncClock();
 
         this.draw();
     },
@@ -925,12 +1438,20 @@ const game = {
             const elapsed = (performance.now() - this.lightTimer) / 1000;
             const lit = Math.min(4, Math.floor(elapsed));
             if (lit !== this.lights && typeof SFX !== 'undefined') {
-                if (lit >= 4) { SFX.go(); if (p.gas > 0.1) SFX.launch(); } else SFX.beep();
+                if (lit >= 4) { SFX.go(); if (p.gas > 0.1) SFX.launch(); } else SFX.treeStep(lit);
             }
             this.lights = lit;
             o.clutch = 1; o.gear = 1;
-            o.gas = (Math.sin(performance.now() / 150) > 0) ? 1 : 0;
-            o.rpm = 1000 + (o.redline - 1000) * 0.5 * (0.5 + 0.5 * Math.sin(performance.now() / 200));
+            if (this._ai) {
+                // Persona driver: revs toward a skill-scaled staging target,
+                // with a live needle wobble — the same controller surface a
+                // human uses (hold throttle at the line, launch off that rev).
+                this._ai.staging(o, dt);
+            } else {
+                // Legacy scripted rev (ghost mode keeps its cinematic idle).
+                o.gas = (Math.sin(performance.now() / 150) > 0) ? 1 : 0;
+                o.rpm = 1000 + (o.redline - 1000) * 0.5 * (0.5 + 0.5 * Math.sin(performance.now() / 200));
+            }
 
             // Green check FIRST: a throttled tab (mobile background GC) can
             // jump a frame straight past 4s — a car moving at that instant
@@ -960,6 +1481,10 @@ const game = {
                     const rd = document.getElementById('reaction-display');
                     if (rd) rd.innerText = 'RT: 0.000s';
                 }
+                // A driver already staged in 1st launches off whatever rev
+                // the clutch-slip zone carried across the green — judged by
+                // the SAME staged-rev rule as an N-dropper (judgeLaunch).
+                if (p.gear === 1 && p.gas > 0.1) p.judgeLaunch();
             } else if (p.speed > 0.5) {
                 // Left before the green — a red light. Drag-racing convention:
                 // the reaction prints NEGATIVE (how early the leave was) and
@@ -978,20 +1503,46 @@ const game = {
             if (AUTO_SHIFT_ENABLED) {
                 if (p.gear === 0 && p.gas > 0.3 && p.clutch < 0.3) {
                     p.gear = 1;
-                    p.shiftTimer = 0.1;
+                    // Auto N→1 at the line IS the launch — judged by the
+                    // staged rev, never by a flat shift cut.
+                    p.judgeLaunch();
                 }
+            }
+
+            // Lazy launch judgment: staged in 1st but got on the gas after
+            // the green — the first moment throttle bites at the line IS
+            // the launch (rpm by then is whatever the slip zone held).
+            if (!p._launchJudged && p.gear === 1 && p.gas > 0.1 && p.speed < 0.5) {
+                p.judgeLaunch();
             }
 
             // Hard braking from speed screeches the tires (throttled in SFX).
             if (p.brake > 0 && p.speed > 8 && typeof SFX !== 'undefined') SFX.brake(p.speed);
 
-            if (this.raceTimer > o.reactionTime && !o.launched && this.raceMode !== 'ghost') {
-                o.launched = true; o.clutch = 0; o.gas = 1; o.gear = 1;
+            // Wheelspin off the line: full throttle while the car is still
+            // barely moving. Capped so it only fires when it is genuinely
+            // the rear stepping out, not on every stalled launch.
+            if (p.gas > 0.5 && p.speed < 9 && p.gear >= 1 && typeof SFX !== 'undefined') {
+                SFX.wheelspin(Math.min(1, p.gas * (1 - p.speed / 9)));
             }
-            if (o.launched && this.raceMode !== 'ghost') {
-                o.clutch = 0; o.gas = 1;
-                if (o.rpm > o.redline * (o.aiShiftPoint || 0.92) && o.gear < o.gearRatios.length - 1) o.shiftUp();
-                if (o.rpm > o.redline - 100) o.rpm = o.redline - 200;
+
+            if (this._ai && this.raceMode !== 'ghost') {
+                // Persona driver: reaction-gated launch, per-gear shift plan
+                // with human flubs, NOS timing and a capped physics-layer
+                // catch-up — see the AIDriver block near getQuickOpponent.
+                this._ai.drive(o, p, dt, this);
+            } else if (this.raceMode !== 'ghost') {
+                // Legacy scripted driver — kept as a safety net for any code
+                // path that races an AI without a persona plan attached.
+                if (this.raceTimer > o.reactionTime && !o.launched) {
+                    o.launched = true; o.clutch = 0; o.gas = 1; o.gear = 1;
+                    o.judgeLaunch();   // same staged-rev launch rule as the player
+                }
+                if (o.launched) {
+                    o.clutch = 0; o.gas = 1;
+                    if (o.rpm > o.redline * (o.aiShiftPoint || 0.92) && o.gear < o.gearRatios.length - 1) o.shiftUp();
+                    if (o.rpm > o.redline - 100) o.rpm = o.redline - 200;
+                }
             }
             if (this.raceMode === 'ghost') {
                 // The ghost is a REPLAY, not a simulation — its position is
@@ -1063,7 +1614,7 @@ const game = {
             const elapsed = (performance.now() - this.lightTimer) / 1000;
             const lit = Math.min(4, Math.max(0, Math.floor(elapsed)));
             if (lit !== this.lights && typeof SFX !== 'undefined') {
-                if (lit >= 4) { SFX.go(); if (p.gas > 0.1) SFX.launch(); } else SFX.beep();
+                if (lit >= 4) { SFX.go(); if (p.gas > 0.1) SFX.launch(); } else SFX.treeStep(lit);
             }
             this.lights = lit;
 
@@ -1072,6 +1623,13 @@ const game = {
             // red-lit by a late frame any more.
             if (elapsed >= 4) {
                 this.raceState = 'RUNNING';
+                // The green light, on THIS side's clock. This is the single
+                // reference point the host measures every rev timestamp
+                // against, recorded from the real transition rather than
+                // recomputed from the light duration — which would be a
+                // second copy of that constant, free to drift out of step
+                // with the race it is judging.
+                MP.goAt = performance.now();
                 this.raceStartTime = performance.now();
                 this.raceTimer = 0;
                 this.showNotification('GO!');
@@ -1116,9 +1674,6 @@ const game = {
 
     finishMultiplayerRace(localReport) {
         if (this.finished) return;
-        // Capture WHY we're finishing before overwriting the state — a fast
-        // opponent only means "false start" while the light is still counting.
-        const stateAtFinish = this.raceState;
         this.finished = true;
         this.raceState = 'FINISHED';
         const p = this.playerCar, o = this.opponentCar;
@@ -1138,11 +1693,14 @@ const game = {
             return;
         }
 
-        // A pre-start finish is the ONLY case where speed > 0.5 means the peer
-        // jumped the gun. Once RUNNING, a fast replica is just... racing —
-        // never misfire the false-start bonus when their report times out.
+        // Fallback used ONLY if no authoritative verdict comes back in time
+        // (host vanished mid-outcome). It must NOT convict the peer: judging
+        // them from a throttled, possibly stale LOCAL REPLICA of their speed
+        // was exactly how the two clients ended up disagreeing — one saw
+        // "false start", the other saw a legal race. With no ruling in hand,
+        // "no false start" is the only claim we can actually support.
         const fallbackRemote = {
-            falseStart: stateAtFinish === 'COUNTDOWN' && !!(o && o.speed > 0.5),
+            falseStart: false,
             finishTime: o && o.finished ? o.finishTime : 999,
         };
         MP.reportOutcome(localReport, fallbackRemote, (remote) => this._applyMultiplayerOutcome(localReport, remote));
@@ -1153,9 +1711,21 @@ const game = {
         // Capture trap speed NOW — this runs synchronously at the finish, while
         // the results screen renders ~400ms later after the car has been braking.
         const trapSpeed = p.trapSpeed || p.speed;
+
+        // The host's ruling supersedes this client's opinion of ITSELF. The
+        // local claim below is only trusted while no verdict exists (offline
+        // result, or the host never answered) — otherwise both sides would be
+        // judging the same launch from two different local clocks, which is the
+        // disagreement the host-authoritative verdict exists to prevent.
+        let myFalseStart = !!local.falseStart;
+        if (typeof MP !== 'undefined' && MP.localFalseStart !== null && MP.localFalseStart !== undefined) {
+            myFalseStart = !!MP.localFalseStart;
+        }
+        remote = remote || { falseStart: false, finishTime: 999 };
+
         let title, prize;
-        if (local.falseStart && remote.falseStart) { title = 'BOTH FALSE STARTED'; prize = 0; }
-        else if (local.falseStart) { title = 'FALSE START'; prize = 0; }
+        if (myFalseStart && remote.falseStart) { title = 'BOTH FALSE STARTED'; prize = 0; }
+        else if (myFalseStart) { title = 'FALSE START'; prize = 0; }
         else if (remote.falseStart) { title = 'OPPONENT FALSE STARTED'; prize = MP_FALSE_START_BONUS; }
         else if ((local.finishTime ?? 999) <= (remote.finishTime ?? 999)) { title = 'VICTORY'; prize = MP_WIN_PRIZE; }
         else { title = 'DEFEAT'; prize = MP_LOSS_PRIZE; }
@@ -1200,13 +1770,27 @@ const game = {
         // it from there.
         if (typeof Profile !== 'undefined' && Profile.recordMpResult) Profile.recordMpResult(s);
 
+        // Career ledger — P2P finish. False-start races count as races
+        // played (mirroring mpStats above); only legit finishes carry an ET.
+        if (typeof Career !== 'undefined' && Career.recordMp) {
+            const mpGap = (legitFinish && (remote.finishTime ?? 999) < 999)
+                ? +(local.finishTime - remote.finishTime).toFixed(3) : null;
+            Career.recordMp({
+                won: (title === 'VICTORY' || title === 'OPPONENT LEFT' || title === 'OPPONENT FALSE STARTED'),
+                et: legitFinish ? local.finishTime : 0,
+                falseStart: myFalseStart,
+                opp: (typeof MP !== 'undefined' && MP.remoteProfile && MP.remoteProfile.name) ? String(MP.remoteProfile.name).slice(0, 18) : null,
+                gap: mpGap, cash: prize || 0
+            });
+        }
+
         // Friends presence memory — remember when you last raced this driver.
         if (typeof Friends !== 'undefined' && Friends.touchLastRaced &&
             typeof MP !== 'undefined' && MP.remoteProfile && MP.remoteProfile.id) {
             Friends.touchLastRaced(Friends.normalizeCode(MP.remoteProfile.id));
         }
 
-        this.cash += prize;
+        this.awardCash(prize, 'mp-result');
         this.scheduleSave();
 
         setTimeout(() => {
@@ -1248,6 +1832,8 @@ const game = {
             }
             const rec = document.getElementById('result-record');
             if (rec) rec.classList.toggle('hidden', !isRecord);
+            const ghostChip = document.getElementById('result-ghost-badge');
+            if (ghostChip) ghostChip.classList.add('hidden');
             // MP tournament series standing (hidden everywhere else).
             const seriesEl = document.getElementById('result-series');
             if (seriesEl) {
@@ -1286,6 +1872,15 @@ const game = {
     // back in the ready-up lobby; the normal READY UP handshake re-launches
     // the race — no re-hosting, no new code.
     rematch() {
+        // Quick race: one tap back onto the line. restartRace() re-runs
+        // startRaceMode('quick'), which re-rolls getQuickOpponent() — a FRESH
+        // opponent from the current curve (rubber-band + persona intact),
+        // not a frozen replay of the car you just raced.
+        if (this.raceMode === 'quick') {
+            if (typeof SFX !== 'undefined' && SFX.click) SFX.click();
+            this.restartRace();
+            return;
+        }
         if (this.raceMode !== 'multiplayer' || typeof MP === 'undefined' || !MP._connected) {
             this.returnToMenu();
             return;
@@ -1389,7 +1984,7 @@ const game = {
         p.speed = 0; p.gas = 0; p.brake = 1;
         o.speed = 0; o.gas = 0;
 
-        let playerTime, reactionTime, prize = 0;
+        let playerTime, reactionTime, prize = 0, careerChampion = false;
         if (reason === 'FALSE START') {
             playerTime = 999; reactionTime = 999; prize = 0;
         } else {
@@ -1410,8 +2005,11 @@ const game = {
                     prize = 250 + Math.floor(Math.random() * 150);
                     this.quickStats.races++;
                     this.quickStats.wins++;
+                    // Streak rubber-band memory (dynamic difficulty).
+                    this.quickStats.streak = (this.quickStats.streak | 0) > 0 ? this.quickStats.streak + 1 : 1;
                 } else if (this.tournamentRound >= 3) {
                     prize = this.activeTournamentTier?.prize || 5000;
+                    careerChampion = true; // final heat taken — the run is complete
                     this.tournamentRound = 1;
                 } else {
                     prize = 0;
@@ -1422,7 +2020,11 @@ const game = {
                     prize = 0;
                 } else {
                     prize = this.raceMode === 'quick' ? 50 : 0;
-                    if (this.raceMode === 'quick') this.quickStats.races++;
+                    if (this.raceMode === 'quick') {
+                        this.quickStats.races++;
+                        // Streak rubber-band memory (dynamic difficulty).
+                        this.quickStats.streak = (this.quickStats.streak | 0) < 0 ? this.quickStats.streak - 1 : -1;
+                    }
                     // A tournament loss ends the run. A new entry always starts at Heat 1.
                     if (this.raceMode === 'tournament') this.tournamentRound = 1;
                 }
@@ -1430,24 +2032,49 @@ const game = {
         }
 
         const prevBest = this.bestET;
-        if (playerTime > 0 && (!this.bestET || playerTime < this.bestET)) this.bestET = playerTime;
-        const isRecord = playerTime > 0 && (!prevBest || playerTime < prevBest);
+        // A FALSE START leaves with the 999 sentinel (the report prints it as
+        // DQ). Recording must honor that too: 999 is never a real ET, so it
+        // can't become the personal best, a record badge, or a ghost seed.
+        const legitTime = reason !== 'FALSE START' && playerTime > 0;
+        if (legitTime && (!this.bestET || playerTime < this.bestET)) this.bestET = playerTime;
+        const isRecord = legitTime && (!prevBest || playerTime < prevBest);
         // A new personal best in a ghost-capable mode becomes the new ghost.
         // Seed rule: a pre-existing bestET (recorded before ghosts existed,
         // or carried from an old save) seeds the ghost on the next legit
         // finish so the feature is never stuck behind an unbeaten record.
-        const seedGhost = playerTime > 0 && !this.ghostRun &&
+        const seedGhost = legitTime && !this.ghostRun &&
             (this.raceMode === 'quick' || this.raceMode === 'ghost');
         if ((isRecord || seedGhost) && this._ghostSamples && this._ghostSamples.length) {
             this._commitGhostRun(playerTime);
         }
-        this.cash += prize;
+        this.awardCash(prize, 'sp-result');
         this.raceResults = {
             playerTime, playerReaction: reactionTime, won,
             opponentName: o.name, trapSpeed, reason
         };
 
         if (this.raceMode === 'quick') this._pendingRotation = true;
+        // Career ledger — single-player finish (quick/tournament/ghost).
+        // A false start never reached the line: ET 0, loss counted.
+        if (typeof Career !== 'undefined' && Career.recordRace) {
+            // Ledger extras for the career panel: rival name/persona, the
+            // signed ET margin (only when BOTH cars crossed the line) and
+            // the prize actually paid — the ledger row is a race RECEIPT.
+            // Persona tier is quick-only: _oppPersona is stale in every
+            // other mode and must never label a tournament or ghost run.
+            // Ghost rivals carry their FULL recorded ET (it's a replay, not
+            // a simulation that ends early) — so a ghost WIN gets an honest
+            // margin too. Quick/tournament rivals only have a time when they
+            // actually crossed (the race ends on the first crossing), and a
+            // missing rival time means NO gap — never a guessed one.
+            const ghostEt = (this.raceMode === 'ghost' && this.ghostRun && typeof this.ghostRun.et === 'number' && this.ghostRun.et < 999)
+                ? this.ghostRun.et : null;
+            const rivalEt = (o && typeof o.finishTime === 'number' && o.finishTime < 999) ? o.finishTime : ghostEt;
+            const oppGap = (legitTime && rivalEt !== null)
+                ? +(playerTime - rivalEt).toFixed(3) : null;
+            Career.recordRace({ won, et: legitTime ? playerTime : 0, mode: this.raceMode, champion: careerChampion, falseStart: reason === 'FALSE START',
+                opp: (o && o.name) || null, tier: this.raceMode === 'quick' ? (this._oppPersona || null) : null, gap: oppGap, cash: prize || 0 });
+        }
         this.scheduleSave();
 
         setTimeout(() => {
@@ -1458,6 +2085,11 @@ const game = {
             const title = document.getElementById('result-title');
             title.innerText = reason || (won ? 'VICTORY' : 'DEFEAT');
             title.style.color = won ? '#4caf50' : '#f44336';
+            // Outcome aura: a soft halo under the headline so the verdict
+            // reads at a glance even on small screens (CSS classes, purely
+            // decorative — colors themselves stay the dev-owned constants).
+            title.classList.toggle('outcome-win', !!won);
+            title.classList.toggle('outcome-loss', !won);
             const falseStart = reason === 'FALSE START';
             // A false start hands the win to the opponent — the card shows
             // whoever actually took the win (you, or the other lane).
@@ -1478,13 +2110,48 @@ const game = {
             }
             document.getElementById('result-trap').innerText = (falseStart || playerTime <= 0) ? '\u2014'
                 : Math.round(trapSpeed * MPS_TO_MPH) + ' mph';
-            document.getElementById('result-prize').innerText = '$' + prize;
+            // Prize ticks up instead of popping in — same arcade cadence
+            // as the cash box. Reduced-motion readers get the final value
+            // immediately, exactly like every other animated flourish here.
+            const prizeEl = document.getElementById('result-prize');
+            const reduceMotion = (typeof matchMedia === 'function') && matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if (prizeEl) {
+                prizeEl.classList.remove('prize-paid');
+                if (prize > 0 && !reduceMotion) {
+                    const t0 = performance.now(), dur = 550;
+                    const tick = (t) => {
+                        const k = Math.min(1, (t - t0) / dur);
+                        const eased = 1 - Math.pow(1 - k, 3);   // ease-out cubic
+                        prizeEl.innerText = '$' + Math.round(prize * eased);
+                        if (k < 1) requestAnimationFrame(tick);
+                        else prizeEl.classList.add('prize-paid');
+                    };
+                    requestAnimationFrame(tick);
+                } else {
+                    prizeEl.innerText = '$' + prize;
+                    if (prize > 0) prizeEl.classList.add('prize-paid');
+                }
+            }
             if (typeof SFX !== 'undefined') {
                 SFX.finish(!!won && !falseStart);
                 if (prize > 0) setTimeout(() => SFX.cash(), 700);
             }
             const rec = document.getElementById('result-record');
             if (rec) rec.classList.toggle('hidden', !isRecord);
+            // Ghost verdict chip (pre-existing markup, now actually wired):
+            // a real replay race is either a NEW GHOST RECORD (you beat the
+            // replay — gold) or a plain GHOST RUN (the replay held you off).
+            // Tournament/quick/DQ paths never show it.
+            const ghostChip = document.getElementById('result-ghost-badge');
+            if (ghostChip) {
+                const showGhost = this.raceMode === 'ghost' && this.ghostRun && legitTime;
+                ghostChip.classList.toggle('hidden', !showGhost);
+                if (showGhost) {
+                    const beatGhost = playerTime < this.ghostRun.et;
+                    ghostChip.innerText = beatGhost ? '\u2605 NEW GHOST RECORD' : 'GHOST RUN';
+                    ghostChip.classList.toggle('results-ghost-record', beatGhost);
+                }
+            }
             // MP tournament series standing (hidden everywhere else).
             const seriesEl = document.getElementById('result-series');
             if (seriesEl) seriesEl.classList.add('hidden');
@@ -1494,16 +2161,33 @@ const game = {
             const oppLabel = document.getElementById('result-opp-label');
             const oppEl = document.getElementById('result-opp-time');
             if (oppRow && oppEl) {
+                // Ghost races replay the recorded run; QUICK races now show
+                // the rival's real timeslip too (Car.update stamps finishTime
+                // for AI opponents). Losses print the time that beat you;
+                // wins keep the row hidden unless the rival also crossed —
+                // a blank rival ET must never imply a margin that is guessed.
+                const oppLegit = o && o.finished && o.finishTime > 0;
                 const showGhost = this.raceMode === 'ghost' && this.ghostRun;
-                oppRow.classList.toggle('hidden', !showGhost);
+                const showQuick = this.raceMode === 'quick' && oppLegit;
+                oppRow.classList.toggle('hidden', !showGhost && !showQuick);
                 oppRow.classList.toggle('results-row-ghost', !!showGhost);
                 if (showGhost) {
                     if (oppLabel) oppLabel.innerText = 'Ghost ET:';
                     oppEl.innerText = this.ghostRun.et.toFixed(3) + 's';
+                } else if (showQuick) {
+                    if (oppLabel) oppLabel.innerText = 'Opponent ET:';
+                    oppEl.innerText = o.finishTime.toFixed(3) + 's';
                 }
             }
+            // RACE AGAIN: quick races get the one-tap loop — the button
+            // re-rolls a fresh opponent from the same difficulty curve.
+            // MP keeps its own REMATCH offer (game.rematch() routes by mode).
             const rematchBtn = document.getElementById('result-rematch-btn');
-            if (rematchBtn) { rematchBtn.classList.add('hidden'); rematchBtn.innerText = 'REMATCH'; }
+            if (rematchBtn) {
+                const quickAgain = this.raceMode === 'quick';
+                rematchBtn.classList.toggle('hidden', !quickAgain);
+                rematchBtn.innerText = quickAgain ? 'RACE AGAIN' : 'REMATCH';
+            }
             const ghostAgain = document.getElementById('result-ghost-again-btn');
             if (ghostAgain) ghostAgain.classList.toggle('hidden', this.raceMode !== 'ghost');
         }, 500);
@@ -1524,13 +2208,250 @@ const game = {
         ctx.restore();
     },
 
+    /* ── Background layer cache ──────────────────────────────────────────
+       Every sky/roof layer used to be repainted from scratch EVERY FRAME:
+       hundreds of fillRects, per-window style switches and per-frame
+       gradients measured at ~2000 canvas ops on a race frame — the single
+       largest main-thread cost in the game. The painters are deterministic
+       per (background, viewport), so each parallax layer is now painted
+       ONCE into a repeating band canvas (exactly one wrap period — the
+       painter's own modulo width) and stamped twice per frame. The band
+       stores elements at their RAW positions (no camX, no half-pad shift);
+       the runtime offset -halfPad - (camX*factor mod bandW) reproduces the
+       original modulo math pixel-for-pixel. Static layers (sky, stars,
+       moons) live on one full-screen canvas. Rebuilt only on resize or
+       background change. Quality-neutral: identical output in High and
+       Low FX, both get the win. */
+    _bgKey: null,
+    _bgStatic: null,
+    _bgBands: null,
+    _bgSun: null,
+
+    _bgCtx(w, h) {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const c = document.createElement('canvas');
+        c.width = Math.ceil(w * dpr);
+        c.height = Math.ceil(h * dpr);
+        const bctx = c.getContext('2d');
+        bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return { c, bctx };
+    },
+
+    _bgBuild(id, W, H) {
+        const bands = [];
+        const band = (bandW, factor, halfPad, paint) => {
+            const b = this._bgCtx(bandW, H);
+            paint(b.bctx);
+            bands.push({ canvas: b.c, factor, halfPad, bandW });
+        };
+        const S = this._bgCtx(W, H), sky = S.bctx;
+        let sun = null;
+
+        if (id === 'night_city') {
+            this._fillSky(sky, W, H, '#021a35', '#0a2a50', '#0d47a1');
+            sky.fillStyle = '#fff';
+            for (let i = 0; i < 40; i++) {
+                const sx = (i * 137.5) % W;
+                const sy = (i * 67.3) % (H * 0.4);
+                const size = (i % 3 === 0) ? 2 : 1;
+                sky.globalAlpha = 0.3 + Math.abs(Math.sin(i)) * 0.5;
+                sky.fillRect(sx, sy, size, size);
+            }
+            sky.globalAlpha = 1;
+            band(W + 200, 0.08, 100, (g) => {
+                const base = H * 0.72;
+                g.fillStyle = '#050a14';
+                for (let i = 0; i < Math.floor(W / 45) + 4; i++) {
+                    const seed = i * 137.5;
+                    const h = 60 + Math.abs(Math.sin(seed)) * 90 + Math.abs(Math.cos(seed * 0.7)) * 40;
+                    const bx = i * 45;
+                    g.fillRect(bx, base - h, 40, h);
+                    for (let wy = 0; wy < Math.floor(h / 22); wy++) {
+                        for (let wx = 0; wx < 2; wx++) {
+                            g.fillStyle = Math.abs(Math.sin(seed + wy * 31 + wx * 17)) > 0.55 ? '#1a2a4a' : '#0a1525';
+                            g.fillRect(bx + 8 + wx * 16, base - h + 12 + wy * 22, 8, 10);
+                        }
+                    }
+                    g.fillStyle = '#050a14';
+                }
+            });
+        } else if (id === 'sunset_highway') {
+            this._fillSky(sky, W, H, '#2b1055', '#c96e4a', '#f7b267');
+            // The moving sun glow: a radial gradient already fully
+            // transparent at r=90 — cached once as a 200x200 sprite.
+            const sunC = this._bgCtx(200, 200);
+            const sg = sunC.bctx.createRadialGradient(100, 100, 5, 100, 100, 90);
+            sg.addColorStop(0, '#fff2a8');
+            sg.addColorStop(0.4, '#ffb347');
+            sg.addColorStop(1, 'rgba(255,100,50,0)');
+            sunC.bctx.fillStyle = sg;
+            sunC.bctx.fillRect(0, 0, 200, 200);
+            sun = sunC.c;
+            band(W + 300, 0.05, 150, (g) => {
+                g.fillStyle = '#1a0a2a';
+                for (let i = 0; i < Math.floor(W / 80) + 3; i++) {
+                    const seed = i * 91.3;
+                    const h = 40 + Math.abs(Math.sin(seed)) * 40;
+                    const bx = i * 80;
+                    g.beginPath();
+                    g.moveTo(bx, H * 0.72);
+                    g.lineTo(bx + 40, H * 0.72 - h);
+                    g.lineTo(bx + 80, H * 0.72);
+                    g.closePath();
+                    g.fill();
+                }
+            });
+            band(W + 400, 0.12, 200, (g) => {
+                const baseY = H * 0.72;
+                g.fillStyle = '#0d0418';
+                for (let i = 0; i < Math.floor(W / 180) + 2; i++) {
+                    const px = i * 180 + 50;
+                    g.fillRect(px, baseY - 70, 4, 70);
+                    for (let a = 0; a < 5; a++) {
+                        const angle = -Math.PI / 2 + (a - 2) * 0.5;
+                        g.save();
+                        g.translate(px + 2, baseY - 70);
+                        g.rotate(angle);
+                        g.fillRect(0, -18, 3, 18);
+                        g.restore();
+                    }
+                }
+            });
+        } else if (id === 'industrial') {
+            this._fillSky(sky, W, H, '#1a1005', '#2a1a08', '#3a2a10');
+            sky.fillStyle = '#e8d8a0';
+            sky.beginPath(); sky.arc(W * 0.15, H * 0.18, 22, 0, Math.PI * 2); sky.fill();
+            sky.fillStyle = '#1a1005';
+            sky.beginPath(); sky.arc(W * 0.17, H * 0.16, 18, 0, Math.PI * 2); sky.fill();
+            band(W + 300, 0.06, 150, (g) => {
+                const base = H * 0.72;
+                for (let i = 0; i < Math.floor(W / 100) + 3; i++) {
+                    const seed = i * 53.7;
+                    const bx = i * 100;
+                    const w = 60 + Math.abs(Math.sin(seed)) * 40;
+                    const h = 80 + Math.abs(Math.cos(seed)) * 60;
+                    g.fillStyle = '#0a0500';
+                    g.fillRect(bx, base - h, w, h);
+                    for (let s = 0; s < 2; s++) {
+                        const sx = bx + 10 + s * (w - 30);
+                        g.fillRect(sx, base - h - 40, 8, 40);
+                        g.fillStyle = 'rgba(80,70,60,0.3)';
+                        for (let p = 0; p < 3; p++) {
+                            g.beginPath();
+                            g.arc(sx + 4 + p * 5, base - h - 45 - p * 12, 8 + p * 3, 0, Math.PI * 2);
+                            g.fill();
+                        }
+                        g.fillStyle = '#0a0500';
+                    }
+                    for (let wy = 0; wy < 3; wy++) {
+                        for (let wx = 0; wx < Math.floor(w / 20); wx++) {
+                            if (Math.abs(Math.sin(seed + wy * 13 + wx * 7)) > 0.5) {
+                                g.fillStyle = '#c9a050';
+                                g.fillRect(bx + 8 + wx * 20, base - h + 15 + wy * 25, 8, 12);
+                                g.fillStyle = '#0a0500';
+                            }
+                        }
+                    }
+                }
+            });
+        } else if (id === 'mountain_dusk') {
+            this._fillSky(sky, W, H, '#0a0520', '#2a1a4a', '#6a3a7a');
+            sky.fillStyle = '#fff';
+            for (let i = 0; i < 30; i++) {
+                const sx = (i * 173.3) % W;
+                const sy = (i * 47.1) % (H * 0.35);
+                sky.globalAlpha = 0.4 + Math.abs(Math.sin(i * 1.3)) * 0.4;
+                sky.fillRect(sx, sy, 2, 2);
+            }
+            sky.globalAlpha = 1;
+            band(W + 400, 0.04, 200, (g) => {
+                const baseY = H * 0.72;
+                g.fillStyle = '#2a1a3a';
+                for (let i = 0; i < Math.floor(W / 120) + 3; i++) {
+                    const seed = i * 71.1;
+                    const bx = i * 120;
+                    g.beginPath();
+                    g.moveTo(bx - 40, baseY);
+                    g.lineTo(bx, baseY - 70 - Math.abs(Math.sin(seed)) * 50);
+                    g.lineTo(bx + 40, baseY - 30 - Math.abs(Math.cos(seed)) * 30);
+                    g.lineTo(bx + 80, baseY);
+                    g.closePath();
+                    g.fill();
+                }
+            });
+            band(W + 400, 0.07, 200, (g) => {
+                const baseY = H * 0.72 - 18;
+                g.fillStyle = '#0f0520';
+                for (let i = 0; i < Math.floor(W / 120) + 3; i++) {
+                    const seed = i * 71.1 + 100;
+                    const bx = i * 120;
+                    g.beginPath();
+                    g.moveTo(bx - 40, baseY);
+                    g.lineTo(bx, baseY - 70 - Math.abs(Math.sin(seed)) * 50);
+                    g.lineTo(bx + 40, baseY - 30 - Math.abs(Math.cos(seed)) * 30);
+                    g.lineTo(bx + 80, baseY);
+                    g.closePath();
+                    g.fill();
+                }
+            });
+        } else { /* neon_tokyo */
+            this._fillSky(sky, W, H, '#05000d', '#12002a', '#1e003a');
+            band(W + 300, 0.09, 150, (g) => {
+                const base = H * 0.72;
+                const neonColors = ['#c9407a', '#5fa8b8', '#b8923a', '#5ca87a'];
+                for (let i = 0; i < Math.floor(W / 65) + 3; i++) {
+                    const seed = i * 189.7;
+                    const h = 55 + Math.abs(Math.sin(seed)) * 80;
+                    const bx = i * 65;
+                    g.fillStyle = '#08001a';
+                    g.fillRect(bx, base - h, 55, h);
+                    for (let ny = 0; ny < Math.floor(h / 45); ny++) {
+                        const colorSeed = Math.abs(Math.sin(seed * 1.3 + ny * 5.1));
+                        if (colorSeed > 0.55) {
+                            const color = neonColors[Math.floor(colorSeed * 100) % neonColors.length];
+                            g.fillStyle = color;
+                            g.globalAlpha = 0.35;
+                            g.fillRect(bx + 6, base - h + 12 + ny * 45, 18, 2);
+                            g.globalAlpha = 1;
+                        }
+                    }
+                    for (let wy = 0; wy < Math.floor(h / 20); wy++) {
+                        for (let wx = 0; wx < 3; wx++) {
+                            if (Math.abs(Math.sin(seed + wy * 23 + wx * 13)) > 0.7) {
+                                g.fillStyle = '#1a2a4a';
+                                g.fillRect(bx + 6 + wx * 16, base - h + 12 + wy * 20, 8, 6);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        this._bgStatic = S.c;
+        this._bgBands = bands;
+        this._bgSun = sun;
+        this._bgKey = id + '|' + W + '|' + H;
+    },
+
     drawBackground(ctx, W, H, camX) {
-        const bg = this.backgrounds[this.currentBackground];
-        if (bg === 'sunset_highway') return this.bgSunsetHighway(ctx, W, H, camX);
-        if (bg === 'industrial') return this.bgIndustrial(ctx, W, H, camX);
-        if (bg === 'mountain_dusk') return this.bgMountainDusk(ctx, W, H, camX);
-        if (bg === 'neon_tokyo') return this.bgNeonTokyo(ctx, W, H, camX);
-        return this.bgNightCity(ctx, W, H, camX);
+        const id = this.backgrounds[this.currentBackground];
+        const key = id + '|' + W + '|' + H;
+        if (key !== this._bgKey) this._bgBuild(id, W, H);
+        ctx.drawImage(this._bgStatic, 0, 0, W, H);
+        for (let i = 0; i < this._bgBands.length; i++) {
+            const b = this._bgBands[i];
+            const off = (camX * b.factor) % b.bandW;
+            // Two consecutive period tiles always cover [0, W] (bandW > W):
+            // the k0 tile contains x=0, k0+1 closes the right edge.
+            const k0 = Math.floor((b.halfPad + off) / b.bandW);
+            for (let k = k0; k <= k0 + 1; k++) {
+                ctx.drawImage(b.canvas, k * b.bandW - b.halfPad - off, 0, b.bandW, H);
+            }
+        }
+        if (this._bgSun) {
+            const sunX = W * 0.7 - (camX * 0.02) % (W * 1.5);
+            if (sunX > -120 && sunX < W + 120) ctx.drawImage(this._bgSun, sunX - 100, H * 0.55 - 100);
+        }
     },
 
     _fillSky(ctx, W, H, topColor, midColor, botColor) {
@@ -1540,179 +2461,6 @@ const game = {
         grad.addColorStop(1, botColor);
         ctx.fillStyle = grad;
         ctx.fillRect(0, 0, W, H);
-    },
-
-    bgNightCity(ctx, W, H, camX) {
-        this._fillSky(ctx, W, H, '#021a35', '#0a2a50', '#0d47a1');
-        ctx.fillStyle = '#fff';
-        for (let i = 0; i < 40; i++) {
-            const sx = (i * 137.5) % W;
-            const sy = (i * 67.3) % (H * 0.4);
-            const size = (i % 3 === 0) ? 2 : 1;
-            ctx.globalAlpha = 0.3 + Math.abs(Math.sin(i)) * 0.5;
-            ctx.fillRect(sx, sy, size, size);
-        }
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = '#050a14';
-        const base = H * 0.72;
-        for (let i = 0; i < Math.floor(W / 45) + 4; i++) {
-            const seed = i * 137.5;
-            const h = 60 + Math.abs(Math.sin(seed)) * 90 + Math.abs(Math.cos(seed * 0.7)) * 40;
-            let bx = (i * 45) - (camX * 0.08);
-            bx = ((bx % (W + 200)) + W + 200) % (W + 200) - 100;
-            ctx.fillRect(bx, base - h, 40, h);
-            for (let wy = 0; wy < Math.floor(h / 22); wy++) {
-                for (let wx = 0; wx < 2; wx++) {
-                    ctx.fillStyle = Math.abs(Math.sin(seed + wy * 31 + wx * 17)) > 0.55 ? '#1a2a4a' : '#0a1525';
-                    ctx.fillRect(bx + 8 + wx * 16, base - h + 12 + wy * 22, 8, 10);
-                }
-            }
-            ctx.fillStyle = '#050a14';
-        }
-    },
-
-    bgSunsetHighway(ctx, W, H, camX) {
-        this._fillSky(ctx, W, H, '#2b1055', '#c96e4a', '#f7b267');
-        const sunY = H * 0.55;
-        const sunX = W * 0.7 - (camX * 0.02) % (W * 1.5);
-        const sunGrad = ctx.createRadialGradient(sunX, sunY, 5, sunX, sunY, 90);
-        sunGrad.addColorStop(0, '#fff2a8');
-        sunGrad.addColorStop(0.4, '#ffb347');
-        sunGrad.addColorStop(1, 'rgba(255,100,50,0)');
-        ctx.fillStyle = sunGrad;
-        ctx.fillRect(0, 0, W, H);
-        ctx.fillStyle = '#1a0a2a';
-        for (let i = 0; i < Math.floor(W / 80) + 3; i++) {
-            const seed = i * 91.3;
-            const h = 40 + Math.abs(Math.sin(seed)) * 40;
-            let bx = (i * 80) - (camX * 0.05);
-            bx = ((bx % (W + 300)) + W + 300) % (W + 300) - 150;
-            ctx.beginPath();
-            ctx.moveTo(bx, H * 0.72);
-            ctx.lineTo(bx + 40, H * 0.72 - h);
-            ctx.lineTo(bx + 80, H * 0.72);
-            ctx.closePath();
-            ctx.fill();
-        }
-        ctx.fillStyle = '#0d0418';
-        for (let i = 0; i < Math.floor(W / 180) + 2; i++) {
-            let px = (i * 180 + 50) - (camX * 0.12);
-            px = ((px % (W + 400)) + W + 400) % (W + 400) - 200;
-            const baseY = H * 0.72;
-            ctx.fillRect(px, baseY - 70, 4, 70);
-            for (let a = 0; a < 5; a++) {
-                const angle = -Math.PI / 2 + (a - 2) * 0.5;
-                ctx.save();
-                ctx.translate(px + 2, baseY - 70);
-                ctx.rotate(angle);
-                ctx.fillRect(0, -18, 3, 18);
-                ctx.restore();
-            }
-        }
-    },
-
-    bgIndustrial(ctx, W, H, camX) {
-        this._fillSky(ctx, W, H, '#1a1005', '#2a1a08', '#3a2a10');
-        ctx.fillStyle = '#e8d8a0';
-        ctx.beginPath();
-        ctx.arc(W * 0.15, H * 0.18, 22, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#1a1005';
-        ctx.beginPath();
-        ctx.arc(W * 0.17, H * 0.16, 18, 0, Math.PI * 2);
-        ctx.fill();
-        const base = H * 0.72;
-        ctx.fillStyle = '#0a0500';
-        for (let i = 0; i < Math.floor(W / 100) + 3; i++) {
-            const seed = i * 53.7;
-            let bx = (i * 100) - (camX * 0.06);
-            bx = ((bx % (W + 300)) + W + 300) % (W + 300) - 150;
-            const w = 60 + Math.abs(Math.sin(seed)) * 40;
-            const h = 80 + Math.abs(Math.cos(seed)) * 60;
-            ctx.fillRect(bx, base - h, w, h);
-            for (let s = 0; s < 2; s++) {
-                const sx = bx + 10 + s * (w - 30);
-                ctx.fillRect(sx, base - h - 40, 8, 40);
-                ctx.fillStyle = 'rgba(80,70,60,0.3)';
-                for (let p = 0; p < 3; p++) {
-                    ctx.beginPath();
-                    ctx.arc(sx + 4 + p * 5, base - h - 45 - p * 12, 8 + p * 3, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-                ctx.fillStyle = '#0a0500';
-            }
-            for (let wy = 0; wy < 3; wy++) {
-                for (let wx = 0; wx < Math.floor(w / 20); wx++) {
-                    if (Math.abs(Math.sin(seed + wy * 13 + wx * 7)) > 0.5) {
-                        ctx.fillStyle = '#c9a050';
-                        ctx.fillRect(bx + 8 + wx * 20, base - h + 15 + wy * 25, 8, 12);
-                        ctx.fillStyle = '#0a0500';
-                    }
-                }
-            }
-        }
-    },
-
-    bgMountainDusk(ctx, W, H, camX) {
-        this._fillSky(ctx, W, H, '#0a0520', '#2a1a4a', '#6a3a7a');
-        ctx.fillStyle = '#fff';
-        for (let i = 0; i < 30; i++) {
-            const sx = (i * 173.3) % W;
-            const sy = (i * 47.1) % (H * 0.35);
-            ctx.globalAlpha = 0.4 + Math.abs(Math.sin(i * 1.3)) * 0.4;
-            ctx.fillRect(sx, sy, 2, 2);
-        }
-        ctx.globalAlpha = 1;
-        for (let layer = 0; layer < 2; layer++) {
-            const offset = layer * 60;
-            const speed = 0.04 + layer * 0.03;
-            const baseY = H * 0.72 - offset * 0.3;
-            ctx.fillStyle = layer === 0 ? '#2a1a3a' : '#0f0520';
-            for (let i = 0; i < Math.floor(W / 120) + 3; i++) {
-                const seed = i * 71.1 + layer * 100;
-                let bx = (i * 120) - (camX * speed);
-                bx = ((bx % (W + 400)) + W + 400) % (W + 400) - 200;
-                ctx.beginPath();
-                ctx.moveTo(bx - 40, baseY);
-                ctx.lineTo(bx, baseY - 70 - Math.abs(Math.sin(seed)) * 50);
-                ctx.lineTo(bx + 40, baseY - 30 - Math.abs(Math.cos(seed)) * 30);
-                ctx.lineTo(bx + 80, baseY);
-                ctx.closePath();
-                ctx.fill();
-            }
-        }
-    },
-
-    bgNeonTokyo(ctx, W, H, camX) {
-        this._fillSky(ctx, W, H, '#05000d', '#12002a', '#1e003a');
-        const base = H * 0.72;
-        for (let i = 0; i < Math.floor(W / 65) + 3; i++) {
-            const seed = i * 189.7;
-            const h = 55 + Math.abs(Math.sin(seed)) * 80;
-            let bx = (i * 65) - (camX * 0.09);
-            bx = ((bx % (W + 300)) + W + 300) % (W + 300) - 150;
-            ctx.fillStyle = '#08001a';
-            ctx.fillRect(bx, base - h, 55, h);
-            const neonColors = ['#c9407a', '#5fa8b8', '#b8923a', '#5ca87a'];
-            for (let ny = 0; ny < Math.floor(h / 45); ny++) {
-                const colorSeed = Math.abs(Math.sin(seed * 1.3 + ny * 5.1));
-                if (colorSeed > 0.55) {
-                    const color = neonColors[Math.floor(colorSeed * 100) % neonColors.length];
-                    ctx.fillStyle = color;
-                    ctx.globalAlpha = 0.35;
-                    ctx.fillRect(bx + 6, base - h + 12 + ny * 45, 18, 2);
-                    ctx.globalAlpha = 1;
-                }
-            }
-            for (let wy = 0; wy < Math.floor(h / 20); wy++) {
-                for (let wx = 0; wx < 3; wx++) {
-                    if (Math.abs(Math.sin(seed + wy * 23 + wx * 13)) > 0.7) {
-                        ctx.fillStyle = '#1a2a4a';
-                        ctx.fillRect(bx + 6 + wx * 16, base - h + 12 + wy * 20, 8, 6);
-                    }
-                }
-            }
-        }
     },
 
     _getCarCanvasMetrics(car) {
@@ -1763,6 +2511,14 @@ const game = {
             }
         }
         if (typeof Profile !== 'undefined' && Profile.data) Profile._refreshChip();
+        // Career chip — achievement counter next to the corner star.
+        const cb = document.getElementById('career-btn-count');
+        if (cb && typeof Career !== 'undefined' && Career.ready && Career.data) {
+            const got = Career.ACHIEVEMENTS.filter(a => Career.data.ach[a.id]).length;
+            cb.textContent = ' ' + got + '/' + Career.ACHIEVEMENTS.length;
+        }
+        // Daily bonus strip — visible only while today's reward is unclaimed.
+        if (typeof DailyBonus !== 'undefined' && DailyBonus.data) DailyBonus.render();
     },
 
     showNotification(text) {
@@ -1820,23 +2576,69 @@ const game = {
 
     getTournamentTier() {
         const score = this.performanceScore(this.playerCar);
-        if (score < 0.38) return { name: 'LIGHT CUP', ai: 0.98, prize: 5000, start: 0 };
-        if (score < 0.66) return { name: 'STREET KINGS', ai: 1.03, prize: 18000, start: 2 };
-        return { name: 'PRO LEAGUE', ai: 1.08, prize: 50000, start: 4 };
+        // LIGHT CUP: stock-car territory. ai eased 0.98 → 0.94 and heat-1
+        // reactions relaxed (see the reactBase map below) so a rookie's
+        // first tournament run is winnable while learning the tree.
+        if (score < 0.38) return { name: 'LIGHT CUP', ai: 0.94, prize: 5000, start: 0, reactBase: 0.40 };
+        if (score < 0.66) return { name: 'STREET KINGS', ai: 1.03, prize: 18000, start: 2, reactBase: 0.34 };
+        return { name: 'PRO LEAGUE', ai: 1.08, prize: 50000, start: 4, reactBase: 0.30 };
     },
 
+    /* ── DYNAMIC DIFFICULTY v3 ────────────────────────────────────────
+       The old model hard-flipped out of "early career" after just 4
+       races, which parked every stock-car player on a permanent 0.86×
+       opponent with pro reactions — unwinnable until real upgrades
+       landed, and it NEVER got easier after a losing streak.
+
+       The replacement is one continuous, streak-aware curve:
+         1. EXPERIENCE — 0→20 races lift the base 0.66 → 0.86. No cliff.
+         2. WIN RATE — winning players meet slightly stronger cars.
+         3. STREAK RUBBER-BAND (matchmaking layer, not physics) — two
+            straight losses hand you up to −0.14 skill; a win streak
+            climbs back gently (+0.05 max). Losing players get easier
+            fields until they breathe again; smashes get promoted.
+         4. STOCK-CAR RELIEF — with zero upgrades the opponent never
+            exceeds 0.80×, so a fresh driver can always race home.
+       The persona driver (reaction, staging, shift flubs) follows the
+       SAME scalar, so a struggling player also draws clumsier drivers.
+       Opponents are picked from the THREE nearest catalog cars
+       (weighted center) for variety instead of the same shell. */
     getQuickOpponent() {
         const playerScore = this.performanceScore(this.playerCar);
         const upgrades = Object.values(this.playerCar.upgrades).reduce((sum, value) => sum + (value === true ? 1 : (typeof value === 'number' ? Math.max(0, value - 1) : 0)), 0);
-        const earlyCareer = this.quickStats.races < 4 && upgrades === 0;
-        const skill = earlyCareer ? 0.67 + this.quickStats.races * 0.035 : Math.min(1.12, 0.86 + upgrades * 0.025 + this.quickStats.wins / Math.max(1, this.quickStats.races) * 0.08);
+        const q = this.quickStats;
+        const winRate = q.races ? q.wins / q.races : 0;
+        const streak = Math.max(-99, Math.min(99, q.streak | 0));
+
+        let skill = 0.66 + Math.min(1, q.races / 20) * 0.20;
+        skill += winRate * 0.10;
+        if (streak <= -2) skill -= Math.min(0.14, (-streak - 1) * 0.045);
+        else if (streak >= 2) skill += Math.min(0.05, (streak - 1) * 0.018);
+        if (upgrades === 0) skill = Math.min(skill, 0.80);
+        skill = Math.max(0.60, Math.min(1.12, skill));
+
         const target = playerScore * skill;
-        let best = this.carDefs[0], bestGap = Infinity;
-        for (const def of this.carDefs) {
-            const gap = Math.abs(def.hp / def.weight - target);
-            if (gap < bestGap) { best = def; bestGap = gap; }
-        }
-        return { def: best, scale: skill * (0.96 + Math.random() * 0.08), reaction: earlyCareer ? 0.46 + Math.random() * .14 : Math.max(.15, .34 - upgrades * .01 + Math.random() * .08), shift: earlyCareer ? .84 : .89 + Math.min(.05, upgrades * .006) };
+        const ranked = this.carDefs
+            .map(def => ({ def, gap: Math.abs(def.hp / def.weight - target) }))
+            .sort((a, b) => a.gap - b.gap)
+            .slice(0, 3);
+        const roll = Math.random();
+        const pickIdx = ranked.length > 2 ? (roll < 0.60 ? 0 : (roll < 0.88 ? 1 : 2)) : 0;
+        const pick = ranked[pickIdx] || ranked[0];
+
+        // Persona scalar: 0 = clumsy rookie, 1 = pro tree, riding the
+        // same curve as the hardware. Run-to-run variance stays bounded.
+        const d = Math.max(0, Math.min(1, (skill - 0.60) / 0.42));
+        const dToday = Math.max(0, Math.min(1, d * (0.92 + Math.random() * 0.16)));
+        const persona = dToday < 0.38 ? 'ROOKIE' : dToday < 0.66 ? 'STREET' : dToday < 0.88 ? 'SEMI-PRO' : 'PRO';
+        return {
+            def: pick.def,
+            scale: skill * (0.985 + Math.random() * 0.03),
+            d: dToday,
+            persona,
+            reaction: Math.max(0.30, 0.62 - skill * 0.24) + Math.random() * 0.08,
+            shift: Math.max(0.83, Math.min(0.93, 0.83 + skill * 0.09)),
+        };
     },
 
     startGhostRace() {
@@ -2022,12 +2824,24 @@ const game = {
     },
 
     startRaceMode(mode) {
+        // Invalidate any pending "opponent disconnected" bounce. Those timers
+        // fire ~1.6s later and only check that SOME race is running, so a
+        // player who quits and immediately starts a fresh race would be
+        // dumped back to the menu mid-race. Bumping the token here retires
+        // every one of them.
+        if (typeof MP !== 'undefined' && MP && MP._lobbyResetToken !== undefined) {
+            MP._lobbyResetToken++;
+        }
         this.raceMode = mode;
         this.state = 'RACE';
         this.menuState = 'RACE';
         this.raceState = 'STAGING';
         this.finished = false;
         this.paused = false;
+        // Persona AI driver — rebuilt per race (quick/tournament only).
+        // Multiplayer and ghost opponents are driven by the network/replay,
+        // never by this.
+        this._ai = null;
         this.effects = new RaceParticles(this.ctx);
 
         document.querySelectorAll('.menu-overlay').forEach(el => el.classList.add('hidden'));
@@ -2093,17 +2907,22 @@ const game = {
             return;
         }
 
-        let def, scaleFactor, aiShift;
+        let def, scaleFactor, aiShift, aiDifficulty;
         if (mode === 'quick') {
             const match = this.getQuickOpponent();
             def = match.def; scaleFactor = match.scale; aiShift = match.shift;
             this._opponentReaction = match.reaction;
+            this._oppPersona = match.persona || null;
+            aiDifficulty = match.d;   // persona scalar for the AI driver
         } else {
             const tier = this.getTournamentTier();
             def = this.carDefs[Math.min(this.carDefs.length - 1, tier.start + this.tournamentRound - 1)];
             scaleFactor = tier.ai + (this.tournamentRound - 1) * .035;
             aiShift = .91 + this.tournamentRound * .01;
-            this._opponentReaction = Math.max(.12, .32 - this.tournamentRound * .025);
+            // Tier-aware reactions: LIGHT heats give a human window,
+            // PRO stays razor-sharp. Rounds sharpen by 30 ms each.
+            this._opponentReaction = Math.max(.16, tier.reactBase - (this.tournamentRound - 1) * .03);
+            this._oppPersona = null;
             this.activeTournamentTier = tier;
         }
 
@@ -2112,7 +2931,28 @@ const game = {
         this.opponentCar.reactionTime = this._opponentReaction;
         this.opponentCar.aiShiftPoint = aiShift;
 
-        document.getElementById('opp-name').innerText = mode === 'tournament' ? this.activeTournamentTier.name + ' • ' + this.opponentCar.name : this.opponentCar.name;
+        // Match-race hardware fairness (quick mode only): if the player runs
+        // a bottle, the opponent's car carries the same stage so the
+        // mid-track pull is an even fight. Tournament hardware stays as
+        // tuned — the persona driver changes HOW it drives, not WHAT it has.
+        if (mode === 'quick' && this.playerCar && this.playerCar.nos > 0) {
+            this.opponentCar.upgrades.nos = Math.max(0, Math.min(3, this.playerCar.nos | 0));
+            this.opponentCar.applyUpgrades();
+        }
+        // Persona driver: quick mode gets its scalar from getQuickOpponent,
+        // tournament derives it from the tier ramp (LIGHT ≈ rookie … PRO ≈ pro).
+        const aiD = (mode === 'quick' && typeof aiDifficulty === 'number')
+            ? aiDifficulty
+            : Math.max(0, Math.min(1, (scaleFactor - 0.96) / 0.2));
+        this._ai = new AIDriver(this.opponentCar, aiD);
+        this.opponentCar.reactionTime = this._ai.reactDelay;
+
+        // HUD opponent line: quick races advertise the DRIVER persona so
+        // the difficulty feels like people, not one car stat. Dev-owned
+        // constant labels only — never player-controlled text.
+        document.getElementById('opp-name').innerText = mode === 'tournament'
+            ? this.activeTournamentTier.name + ' • ' + this.opponentCar.name
+            : (this._oppPersona ? this.opponentCar.name + ' • ' + this._oppPersona : this.opponentCar.name);
         const spOppEl = document.getElementById('opp-name');
         if (spOppEl) spOppEl.style.color = this._hudColor(this.opponentCar.color, '#ff7043');
         document.getElementById('tournament-round').innerText = mode === 'tournament' ? 'HEAT ' + this.tournamentRound + '/3' : 'FREE RUN';
@@ -2156,37 +2996,146 @@ const game = {
 
     openGarage() {
         this.menuState = 'GARAGE';
+        this._garAnimFinish();   // never carry an old slide into a fresh open
         document.getElementById('main-menu').classList.add('hidden');
         document.getElementById('garage-menu').classList.remove('hidden');
-        const container = document.getElementById('car-stats-display');
-        container.innerHTML = '';
-        this.ownedCars.forEach((car, index) => {
-            const div = document.createElement('div');
-            div.className = 'car-item ' + (index === this.selectedCarIndex ? 'selected' : '');
-            const hp = Math.round(car.hp);
-            const pw = (car.hp / car.weight * 1000).toFixed(0);
-            div.innerHTML =
-                '<div>' +
-                    '<div style="color:' + car.color + '; font-size:14px;">' + car.name + '</div>' +
-                    '<div style="font-size:9px; color:#aaa; margin-top:5px;">' +
-                        hp + ' HP &middot; ' + car.weight + 'kg &middot; ' + pw + ' hp/ton' +
-                    '</div>' +
-                    '<div style="font-size:8px; color:#555; margin-top:3px;">' +
-                        'Redline: ' + car.redline + ' &middot; Grip: ' + car.grip.toFixed(2) +
-                    '</div>' +
-                '</div>' +
-                (index === this.selectedCarIndex
-                    ? '<div style="color:#ffeb3b; font-size:10px;">DRIVING</div>'
-                    : '<div style="color:#4caf50; font-size:9px;">SELECT</div>');
-            div.onclick = () => {
-                this.selectedCarIndex = index;
-                this.playerCar = this.ownedCars[index];
-                this.scheduleSave();
-                this.openGarage();
-            };
-            container.appendChild(div);
-        });
+        // Defensive clamp: the save loader already bounds selectedCarIndex,
+        // but a hand-edited save or an array swap mid-session must never
+        // leave the stage pointing outside the owned list — or at an entry
+        // that is not a fully-built car (stepped over, see _validCarIndex).
+        if (!this.ownedCars.length) {
+            this.selectedCarIndex = 0;
+        } else {
+            const cur = this.selectedCarIndex | 0;
+            const curOk = !!this.ownedCars[cur] && !!this.ownedCars[cur].customization;
+            const idx = curOk ? cur : this._validCarIndex(cur, 1);
+            this.selectedCarIndex = idx < 0 ? 0 : Math.min(idx, this.ownedCars.length - 1);
+        }
+        this.playerCar = this.ownedCars[this.selectedCarIndex] || null;
         this._renderGarageCustomizer();
+    },
+
+    /* ─── Garage car navigation (arrows / keyboard) ────────────────────
+       The top car-list is gone: the stage IS the selector now. Single
+       source of truth stays ownedCars + selectedCarIndex — an arrow only
+       moves the index, re-points playerCar and refreshes the mounted
+       customization panel IN PLACE (it is never torn down while browsing).
+       dir = +1 (right / next) | -1 (left / previous), wrap-around. */
+    garageNavigate(dir) {
+        const n = this.ownedCars.length;
+        if (n < 2) return;                     // 0 or 1 car: nothing to browse
+        if (this.state !== 'MENU' || this.menuState !== 'GARAGE') return;
+        const menu = document.getElementById('garage-menu');
+        if (!menu || menu.classList.contains('hidden')) return;
+        this._garAnimFinish();   // rapid taps: snap the in-flight slide first
+        // Target the next fully-built car in the pressed direction (normally
+        // the immediate neighbour; a corrupt entry is stepped over instead of
+        // crashing the stage — see _validCarIndex).
+        const target = this._validCarIndex(this.selectedCarIndex + dir, dir);
+        if (target < 0) return;
+        const fromCar = this.playerCar;
+        this.selectedCarIndex = target;
+        this.playerCar = this.ownedCars[target];
+        if (this.playerCar === fromCar) return;
+        this.scheduleSave();
+        this._updateGarageDisplay();           // customization stays live & mounted
+        this._animateGarageSwap(dir, fromCar);
+        if (typeof SFX !== 'undefined') SFX.tick();
+    },
+
+    /* Nearest fully-built car at-or-after "start", walking in "dir". Real
+       code paths (loadGame's re-derivation + filter, ensureOwnedCar, the
+       dealership) can only ever store complete Car objects, but one corrupt
+       entry — a hand-edited save that slips past every guard, console
+       tampering — used to TypeError the whole stage. Stepping over it keeps
+       browsing alive; selectedCarIndex semantics (an index into ownedCars)
+       are unchanged. */
+    _validCarIndex(start, dir) {
+        const n = this.ownedCars.length;
+        for (let k = 0; k < n; k++) {
+            const idx = (((start + dir * k) % n) + n) % n;
+            const c = this.ownedCars[idx];
+            if (c && c.customization) return idx;
+        }
+        return -1;
+    },
+
+    /* Directional swap on the preview canvas. Right arrow (dir +1): the
+       current car drives OUT toward the right while the new one enters
+       from the left — like walking down a showroom row; left mirrors it.
+       ~320 ms, ease-in-out cubic, drawn through the SAME Renderer.drawCar
+       path as the static frame. REDUCE FX / prefers-reduced-motion renders
+       the swap instantly. Two cars share the stage mid-flight with full
+       clearance (half stage + a car width + margin) so they never overlap;
+       the panel below is untouched while the stage moves. */
+    _animateGarageSwap(dir, fromCar) {
+        const canvas = document.getElementById('garage-preview');
+        if (!canvas || !fromCar || !this.playerCar) { this._drawGaragePreview(); return; }
+        const reduce = document.documentElement.classList.contains('reduce-motion') ||
+            (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches);
+        if (reduce) { this._drawGaragePreview(); return; }
+        const toCar = this.playerCar;
+        const DUR = 320;
+        const t0 = performance.now();
+        const self = this;
+        const anim = this._garAnim = { raf: 0 };
+        const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+        const frame = now => {
+            if (self._garAnim !== anim) return;    // a newer swap owns the canvas
+            const menu = document.getElementById('garage-menu');
+            if (!menu || menu.classList.contains('hidden')) { self._garAnimFinish(); return; }
+            const t = Math.min(1, (now - t0) / DUR);
+            const e = ease(t);
+            self._sizeGaragePreview(canvas);
+            const CW = canvas.width, CH = canvas.height;
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.clearRect(0, 0, CW, CH);
+            // Showroom spotlight glow — identical to the static frame.
+            const glow = ctx.createRadialGradient(CW / 2, CH * 0.62, 8, CW / 2, CH * 0.62, CH * 1.4);
+            glow.addColorStop(0, 'rgba(255,255,255,0.10)');
+            glow.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = glow;
+            ctx.fillRect(0, 0, CW, CH);
+            const scale = Math.min((CW - 16) / 104, (CH - 14) / 44);
+            const xBase = (CW - 104 * scale) / 2;
+            const yBase = CH - 44 * scale - 6;
+            const slide = CW / 2 + 104 * scale / 2 + 30;   // full clearance
+            // Outgoing: exits TOWARD the pressed direction, fading slightly.
+            ctx.save();
+            ctx.globalAlpha = 1 - 0.35 * e;
+            ctx.translate(xBase + dir * slide * e, yBase);
+            ctx.scale(scale, scale);
+            Renderer.drawCar(ctx, fromCar, 0, 0);
+            ctx.restore();
+            // Incoming: enters from the OPPOSITE side, fading in.
+            ctx.save();
+            ctx.globalAlpha = 0.65 + 0.35 * e;
+            ctx.translate(xBase - dir * slide * (1 - e), yBase);
+            ctx.scale(scale, scale);
+            Renderer.drawCar(ctx, toCar, 0, 0);
+            ctx.restore();
+            ctx.strokeStyle = '#2c2f38';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(1, 1, CW - 2, CH - 2);
+            if (t < 1) {
+                anim.raf = requestAnimationFrame(frame);
+            } else {
+                self._garAnim = null;
+                self._drawGaragePreview();   // settle on the exact static frame
+            }
+        };
+        anim.raf = requestAnimationFrame(frame);
+    },
+
+    /* Hard-stop any in-flight swap. Called before every navigation so
+       rapid tapping can never stack two rAF loops or corrupt the stage. */
+    _garAnimFinish() {
+        if (this._garAnim) {
+            if (this._garAnim.raf) cancelAnimationFrame(this._garAnim.raf);
+            this._garAnim = null;
+        }
     },
 
     // ─── Garage customization picker ─────────────────────────────────
@@ -2207,23 +3156,43 @@ const game = {
 
     _renderGarageCustomizer() {
         const panel = document.getElementById('garage-custom');
+        const empty = document.getElementById('gar-empty');
         if (!panel) return;
         const car = this.playerCar;
         panel.innerHTML = '';
-        if (!car) { panel.classList.add('hidden'); return; }
+        this._garVals = null;
+        if (!car || !car.customization) {
+            panel.classList.add('hidden');
+            if (empty) empty.classList.remove('hidden');
+            this._syncGarageArrows();
+            return;
+        }
+        if (empty) empty.classList.add('hidden');
         panel.classList.remove('hidden');
+
+        const vals = this._garVals = { parts: {} };
 
         const title = document.createElement('div');
         title.className = 'gar-title';
-        title.innerHTML = 'CUSTOMIZE <span class="gar-title-car">' + car.name.toUpperCase() + '</span>';
+        title.innerHTML = 'CUSTOMIZE <span class="gar-title-car"></span>';
+        vals.titleCar = title.querySelector('.gar-title-car');
         panel.appendChild(title);
 
-        const preview = document.createElement('canvas');
-        preview.id = 'garage-preview';
-        preview.width = 340;
-        preview.height = 120;
-        preview.setAttribute('aria-label', 'Preview of your customized car');
-        panel.appendChild(preview);
+        /* The preview canvas is STATIC markup inside #gar-stage-frame now —
+           it is never re-created while browsing (only its backing store is
+           resized/redrawn), so the stage cannot flicker or drop a tap
+           mid-swap. The backing store is still sized from the element's own
+           laid-out box in _sizeGaragePreview(), once CSS has resolved — see
+           the original "blurry car" note down at _sizeGaragePreview. */
+        const preview = document.getElementById('garage-preview');
+        if (preview) {
+            preview.width = 680;
+            preview.height = 240;
+            preview.setAttribute('aria-label', 'Preview of your customized car');
+        }
+        vals.stageName = document.getElementById('gar-stage-name');
+        vals.stageStats = document.getElementById('gar-stage-stats');
+        vals.stageIdx = document.getElementById('gar-stage-idx');
 
         const quick = document.createElement('div');
         quick.className = 'gar-quick';
@@ -2247,46 +3216,13 @@ const game = {
         rows.className = 'gar-rows';
         // Paint rows lead the list — body color + accent are the headline
         // customization, then the rim finish and the part groups follow.
-        rows.appendChild(this._makePaintRow('PAINT', 'paint'));
-        rows.appendChild(this._makePaintRow('ACCENT', 'accent'));
-        rows.appendChild(this._makeRimPaintRow());
+        rows.appendChild(this._makePaintRow('PAINT', 'paint', vals));
+        rows.appendChild(this._makePaintRow('ACCENT', 'accent', vals));
+        rows.appendChild(this._makeRimPaintRow(vals));
         this.GAR_GROUPS.forEach(({ key, label, group }) => {
             // rimPaint already rendered as its own swatch row above.
             if (key === 'rimPaint') return;
-            const list = window.CUSTOMIZATION[group];
-            const current = car.customization[key] || list[0];
-            const row = document.createElement('div');
-            row.className = 'gar-row';
-
-            const prev = document.createElement('span');
-            prev.className = 'gar-arrow';
-            prev.textContent = '\u25C0';
-            prev.setAttribute('role', 'button');
-            prev.setAttribute('aria-label', 'Previous ' + label.toLowerCase());
-            prev.tabIndex = 0;
-            prev.onclick = () => this.cycleCustomization(key, -1);
-
-            const next = document.createElement('span');
-            next.className = 'gar-arrow';
-            next.textContent = '\u25B6';
-            next.setAttribute('role', 'button');
-            next.setAttribute('aria-label', 'Next ' + label.toLowerCase());
-            next.tabIndex = 0;
-            next.onclick = () => this.cycleCustomization(key, 1);
-
-            const lab = document.createElement('span');
-            lab.className = 'gar-label';
-            lab.textContent = label;
-
-            const val = document.createElement('span');
-            val.className = 'gar-value';
-            val.textContent = String(current.name || current.id || 'stock').toUpperCase();
-
-            row.appendChild(prev);
-            row.appendChild(lab);
-            row.appendChild(val);
-            row.appendChild(next);
-            rows.appendChild(row);
+            rows.appendChild(this._makePartRow(key, label, group, vals));
         });
         panel.appendChild(rows);
 
@@ -2295,31 +3231,163 @@ const game = {
         hint.textContent = 'LOOKS ONLY — STATS NEVER CHANGE';
         panel.appendChild(hint);
 
+        this._updateGarageDisplay();
         this._drawGaragePreview();
     },
 
+    /* Refresh every value surface of the ALREADY-MOUNTED garage UI from
+       the currently selected car. Nothing is created or destroyed: the
+       customization panel keeps its DOM, scroll position and tap targets
+       while the arrows walk the garage — only text and swatch colors move. */
+    _updateGarageDisplay() {
+        const car = this.playerCar;
+        const vals = this._garVals;
+        if (!car || !vals) { this._renderGarageCustomizer(); return; }
+        const name = String(car.name || '').toUpperCase();
+        if (vals.titleCar) vals.titleCar.textContent = name;
+        if (vals.stageName) vals.stageName.textContent = name;
+        if (vals.stageStats) {
+            const pw = (car.hp / car.weight * 1000).toFixed(0);
+            vals.stageStats.textContent = Math.round(car.hp) + ' HP \u00B7 ' + car.weight + 'kg \u00B7 ' + pw + ' HP/TON';
+        }
+        if (vals.stageIdx) vals.stageIdx.textContent = (this.selectedCarIndex + 1) + '/' + this.ownedCars.length;
+        // Paint + accent swatches (same checker-underlay rule as build time).
+        if (vals.paint) this._setSwatch(vals.paint, this.PAINTS[this._paintIdx(car.color)]);
+        if (vals.accent) this._setSwatch(vals.accent, this.PAINTS[this._paintIdx(car.secondaryColor)]);
+        if (vals.rimPaint) {
+            const list = window.CUSTOMIZATION.rimPaints;
+            const sel = car.customization.rimPaint || list[0];
+            this._setSwatch(vals.rimPaint, { hex: rimPaintColor(car, '#6f7780'), name: String(sel.name || 'stock').toUpperCase() });
+        }
+        this.GAR_GROUPS.forEach(({ key }) => {
+            if (key === 'rimPaint') return;
+            const ref = vals.parts[key];
+            if (!ref) return;
+            const list = window.CUSTOMIZATION[ref.group];
+            const current = car.customization[key] || list[0];
+            ref.val.textContent = String(current.name || current.id || 'stock').toUpperCase();
+        });
+        this._syncGarageArrows();
+    },
+
+/* V10G1-PREVIEW-REDRAW */
+    /* Part/paint changed on the CURRENT car: refresh the mounted panel in
+       place (no rebuild — scroll position and tap rhythm survive) AND
+       redraw the preview canvas from the live car object.
+       The canvas used to be drawn only on customizer REBUILD (garage open
+       / swap settle), which is why a paint or part change stayed invisible
+       until the player left the garage and came back — the panel text
+       moved while the stage kept showing the old build. Renderer.drawCar
+       reads every customization field straight off this.playerCar, so
+       this one redraw IS the live preview; it is a single 680x240 canvas
+       paint, not a scene redraw. (V10G1-PREVIEW-REDRAW) */
+    _garRefresh() {
+        this._updateGarageDisplay();
+        this._drawGaragePreview();
+    },
+
+    _setSwatch(ref, paint) {
+        if (!ref || !ref.sw) return;
+        ref.sw.style.backgroundColor = paint.hex;
+        ref.sw.classList.toggle('gar-swatch-dark', this._paintLum(paint.hex) < 0.35);
+        if (ref.name) ref.name.textContent = String(paint.name || '');
+    },
+
+    _paintLum(hex) {
+        const h = parseInt(String(hex || '#000000').slice(1), 16);
+        return (0.2126 * ((h >> 16) & 255) + 0.7152 * ((h >> 8) & 255) + 0.0722 * (h & 255)) / 255;
+    },
+
+    /* Arrows go dormant (dimmed, inert) with fewer than two owned cars —
+       layout stays identical, so the stage never jumps. */
+    _syncGarageArrows() {
+        const multi = this.ownedCars.length > 1;
+        ['gar-prev', 'gar-next'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.classList.toggle('gar-nav-disabled', !multi);
+            el.setAttribute('aria-disabled', String(!multi));
+        });
+    },
+
+    /* Size the garage preview's backing store to its real, laid-out CSS box at
+       device resolution, so it renders 1:1 with the pixels the screen shows
+       instead of being resampled. Called on every customizer rebuild and on
+       resize; cheap because it no-ops when the box has not changed. */
+    _sizeGaragePreview(canvas) {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        // offsetWidth/offsetHeight reflect the live LAYOUT box (the
+        // mobile/portrait and short-viewport media queries all resize this
+        // element) and — critically — are PRE-transform, so the portrait
+        // stage's rotation cannot feed a rect→attribute feedback loop back
+        // into the backing store. They read 0 only while the element is
+        // display:none, where the rect fallback (measured only when the
+        // stage is visible) takes over.
+/* SCALE-1-SIZE */
+        /* SCALE-1: the fallback chain used to end in "|| canvas.width" —
+           the canvas's OWN attribute. While the garage was hidden both
+           layout reads are 0, so the store fed itself (attribute ×dpr per
+           call) and the car GREW on the next open — the "preview gets
+           bigger every time I change paint" bug. The store may only ever
+           be derived from the LAYOUT, never from itself: with no
+           measurement there is nothing to fit, so the last good store is
+           kept and the next open re-measures normally. */
+/* SCALE-2-CONTENT-BOX */
+        /* SCALE-2: measure the border-free CONTENT box (clientWidth/
+           clientHeight) — exactly the pixel area the backing store is
+           meant to match. offsetWidth/Height include the 2px border,
+           which used to inject an extra +4px into every re-measure.
+           Layout height itself is now attribute-independent (the CSS
+           aspect-ratio on #garage-preview), so this measurement cannot
+           be influenced by what we last drew. */
+        const r = canvas.getBoundingClientRect();
+        const w = canvas.clientWidth || Math.round(r.width);
+        const h = canvas.clientHeight || Math.round(w * 240 / 680);
+        if (!w || !h) return;
+        const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+        if (canvas.width !== bw || canvas.height !== bh) {
+            canvas.width = bw;
+            canvas.height = bh;
+        }
+    },
+
+/* SCALE-1-HIDDEN-GUARD */
     _drawGaragePreview() {
         const canvas = document.getElementById('garage-preview');
         if (!canvas || !this.playerCar) return;
+        /* SCALE-1 companion: never size/draw while the garage is hidden —
+           there is nothing visible to fit, and painting into a hidden
+           canvas is exactly where unmeasurable sizing used to run. */
+        const garMenu = document.getElementById('garage-menu');
+        if (garMenu && garMenu.classList.contains('hidden')) return;
+        this._sizeGaragePreview(canvas);
         const ctx = canvas.getContext('2d');
-        ctx.imageSmoothingEnabled = false;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Smoothing stays ON: the artwork is vector, and this store now matches
+        // the device pixel grid, so smoothing only helps the rare sub-pixel case.
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        const CW = canvas.width, CH = canvas.height;
+        ctx.clearRect(0, 0, CW, CH);
         // Showroom spotlight glow
-        const glow = ctx.createRadialGradient(canvas.width / 2, canvas.height * 0.62, 8, canvas.width / 2, canvas.height * 0.62, 170);
+        const glow = ctx.createRadialGradient(CW / 2, CH * 0.62, 8, CW / 2, CH * 0.62, CH * 1.4);
         glow.addColorStop(0, 'rgba(255,255,255,0.10)');
         glow.addColorStop(1, 'rgba(0,0,0,0)');
         ctx.fillStyle = glow;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillRect(0, 0, CW, CH);
         ctx.save();
-        const scale = 2.9;
-        ctx.translate((canvas.width - 104 * scale) / 2, canvas.height - 44 * scale - 6);
+        /* Fit the car to the box rather than assuming one: the art is ~104x44
+           units, so the scale is derived from the real available width. That
+           keeps the car sharp AND correctly framed on a 200px phone preview
+           and a 420px desktop one alike. */
+        const scale = Math.min((CW - 16) / 104, (CH - 14) / 44);
+        ctx.translate((CW - 104 * scale) / 2, CH - 44 * scale - 6);
         ctx.scale(scale, scale);
         Renderer.drawCar(ctx, this.playerCar, 0, 0);
         ctx.restore();
         // Frame line
         ctx.strokeStyle = '#2c2f38';
         ctx.lineWidth = 2;
-        ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+        ctx.strokeRect(1, 1, CW - 2, CH - 2);
     },
 
     cycleCustomization(key, dir) {
@@ -2334,7 +3402,7 @@ const game = {
         car.customization[key] = next;
         this.showNotification(meta.label + ': ' + String(next.name || next.id).toUpperCase());
         this.scheduleSave();
-        this._renderGarageCustomizer();
+        this._garRefresh();
     },
 
     // Curated pixel-friendly palette for the PAINT / ACCENT steppers.
@@ -2366,10 +3434,7 @@ const game = {
         return this.PAINTS[this._paintIdx(hex)].name;
     },
 
-    _makePaintRow(label, kind) {
-        const car = this.playerCar;
-        const paint = this.PAINTS[this._paintIdx(kind === 'accent' ? car.secondaryColor : car.color)];
-
+    _makePaintRow(label, kind, vals) {
         const row = document.createElement('div');
         row.className = 'gar-row';
 
@@ -2397,16 +3462,13 @@ const game = {
         val.className = 'gar-value gar-value-paint';
         const sw = document.createElement('span');
         sw.className = 'gar-swatch';
-        // backgroundColor (NOT the shorthand) — the shorthand would wipe the
-        // checkerboard underlay that makes dark paints readable as chips.
-        sw.style.backgroundColor = paint.hex;
-        // The checker underlay only earns its keep on dark paints; on bright
-        // ones it just reads as noise.
-        const _hex = parseInt(paint.hex.slice(1), 16);
-        const _lum = (0.2126 * ((_hex >> 16) & 255) + 0.7152 * ((_hex >> 8) & 255) + 0.0722 * (_hex & 255)) / 255;
-        if (_lum < 0.35) sw.classList.add('gar-swatch-dark');
         val.appendChild(sw);
-        val.appendChild(document.createTextNode(paint.name));
+        const name = document.createTextNode('');
+        val.appendChild(name);
+        // The chip fill + checker underlay are applied by _updateGarageDisplay
+        // (backgroundColor, NOT the shorthand — the shorthand would wipe the
+        // checkerboard underlay that makes dark paints readable as chips).
+        if (vals) vals[kind] = { sw, name };
 
         row.appendChild(prev);
         row.appendChild(lab);
@@ -2420,12 +3482,7 @@ const game = {
     // 'stock' shows the neutral steel finish, 'accent' mirrors the current
     // ACCENT chip (and follows it live once redrawn), the rest show their
     // own finish. cycling uses the generic part pipeline (IDs + save).
-    _makeRimPaintRow() {
-        const car = this.playerCar;
-        const list = CUSTOMIZATION.rimPaints;
-        const sel = car.customization.rimPaint || list[0];
-        const resolved = rimPaintColor(car, '#6f7780');
-
+    _makeRimPaintRow(vals) {
         const row = document.createElement('div');
         row.className = 'gar-row';
 
@@ -2453,12 +3510,49 @@ const game = {
         val.className = 'gar-value gar-value-paint';
         const sw = document.createElement('span');
         sw.className = 'gar-swatch';
-        sw.style.backgroundColor = resolved;
-        const _hex = parseInt((resolved || '#6f7780').slice(1), 16);
-        const _lum = (0.2126 * ((_hex >> 16) & 255) + 0.7152 * ((_hex >> 8) & 255) + 0.0722 * (_hex & 255)) / 255;
-        if (_lum < 0.35) sw.classList.add('gar-swatch-dark');
         val.appendChild(sw);
-        val.appendChild(document.createTextNode(String(sel.name || 'stock').toUpperCase()));
+        const name = document.createTextNode('');
+        val.appendChild(name);
+        // Chip fill + label come from _updateGarageDisplay so the row follows
+        // ACCENT live when the rim paint is set to 'accent'.
+        if (vals) vals.rimPaint = { sw, name };
+
+        row.appendChild(prev);
+        row.appendChild(lab);
+        row.appendChild(val);
+        row.appendChild(next);
+        return row;
+    },
+
+    /* Generic part stepper row (‹ LABEL value ›). The value span registers
+       in vals.parts[key] so car swaps refresh it without a rebuild. */
+    _makePartRow(key, label, group, vals) {
+        const row = document.createElement('div');
+        row.className = 'gar-row';
+
+        const prev = document.createElement('span');
+        prev.className = 'gar-arrow';
+        prev.textContent = '\u25C0';
+        prev.setAttribute('role', 'button');
+        prev.setAttribute('aria-label', 'Previous ' + label.toLowerCase());
+        prev.tabIndex = 0;
+        prev.onclick = () => this.cycleCustomization(key, -1);
+
+        const next = document.createElement('span');
+        next.className = 'gar-arrow';
+        next.textContent = '\u25B6';
+        next.setAttribute('role', 'button');
+        next.setAttribute('aria-label', 'Next ' + label.toLowerCase());
+        next.tabIndex = 0;
+        next.onclick = () => this.cycleCustomization(key, 1);
+
+        const lab = document.createElement('span');
+        lab.className = 'gar-label';
+        lab.textContent = label;
+
+        const val = document.createElement('span');
+        val.className = 'gar-value';
+        if (vals) vals.parts[key] = { val, group };
 
         row.appendChild(prev);
         row.appendChild(lab);
@@ -2475,7 +3569,7 @@ const game = {
         if (kind === 'accent') car.secondaryColor = paint.hex; else car.color = paint.hex;
         this.showNotification((kind === 'accent' ? 'ACCENT: ' : 'PAINT: ') + paint.name);
         this.scheduleSave();
-        this._renderGarageCustomizer();
+        this._garRefresh();
     },
 
     randomizeCustomization() {
@@ -2487,7 +3581,7 @@ const game = {
         car.secondaryColor = this.PAINTS[Math.floor(Math.random() * this.PAINTS.length)].hex;
         this.showNotification('RANDOM BUILD');
         this.scheduleSave();
-        this._renderGarageCustomizer();
+        this._garRefresh();
     },
 
     stockCustomization() {
@@ -2499,9 +3593,31 @@ const game = {
         if (def) { car.color = def.color; car.secondaryColor = def.secondaryColor; }
         this.showNotification('STOCK PARTS');
         this.scheduleSave();
-        this._renderGarageCustomizer();
+        this._garRefresh();
     },
 
+/* V10G3-SHOP-ICONS */
+    /* ─── Performance shop part icons (V10G3-SHOP-ICONS) ──────────────────────────────────
+       Inline SVG (no image requests, no broken-asset state, scales with
+       the card through .shop-icon CSS). 48x48 grid, one flat steel
+       palette + one accent per part, consistent top-left light. Keyed by
+       the upgrade key used in openShop(); missing keys simply render
+       iconless rows. */
+    SHOP_ICONS: {
+        engine: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><g fill="#c9a227"><rect x="13" y="4" width="3" height="6" rx="1"/><rect x="20" y="4" width="3" height="6" rx="1"/><rect x="27" y="4" width="3" height="6" rx="1"/><rect x="34" y="4" width="3" height="6" rx="1"/><rect x="13" y="38" width="3" height="6" rx="1"/><rect x="20" y="38" width="3" height="6" rx="1"/><rect x="27" y="38" width="3" height="6" rx="1"/><rect x="34" y="38" width="3" height="6" rx="1"/><rect x="4" y="13" width="6" height="3" rx="1"/><rect x="4" y="20" width="6" height="3" rx="1"/><rect x="4" y="27" width="6" height="3" rx="1"/><rect x="4" y="34" width="6" height="3" rx="1"/><rect x="38" y="13" width="6" height="3" rx="1"/><rect x="38" y="20" width="6" height="3" rx="1"/><rect x="38" y="27" width="6" height="3" rx="1"/><rect x="38" y="34" width="6" height="3" rx="1"/></g><rect x="10" y="10" width="28" height="28" rx="3" fill="#3a4048"/><rect x="10" y="10" width="28" height="6" rx="3" fill="#4a525c"/><rect x="15" y="15" width="18" height="18" rx="2" fill="#22262b"/><path d="M20 19h4v4h4M28 19v4h-3M19 29v-3h3" stroke="#4fc3f7" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="29" cy="28" r="1.4" fill="#4fc3f7"/><circle cx="19" cy="19" r="1.4" fill="#4fc3f7"/></svg>',
+        injector: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="11" width="40" height="7" rx="3.5" fill="#8a93a3"/><rect x="4" y="11" width="40" height="2.6" rx="1.3" fill="#aeb6c0"/><rect x="8" y="6" width="9" height="5" rx="1" fill="#5c6672"/><rect x="31" y="6" width="9" height="5" rx="1" fill="#5c6672"/><path d="M11 18h6l1.6 9H9.4z" fill="#5c6672"/><rect x="10" y="27" width="8" height="6.6" rx="2" fill="#3a4048"/><path d="M13.2 33.6h1.6l.7 4.4h-3z" fill="#cfd6dd"/><path d="M31 18h6l1.6 9h-9.2z" fill="#5c6672"/><rect x="30" y="27" width="8" height="6.6" rx="2" fill="#3a4048"/><path d="M33.2 33.6h1.6l.7 4.4h-3z" fill="#cfd6dd"/><g fill="#4fc3f7"><circle cx="14" cy="42" r="1.1"/><circle cx="34" cy="42" r="1.1"/><circle cx="16.4" cy="44.4" r=".8"/><circle cx="36.4" cy="44.4" r=".8"/></g></svg>',
+        turbo: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M22 9a15 15 0 0 1 15 15h-5a10 10 0 0 0-10-10z" fill="#6f7780"/><circle cx="22" cy="24" r="15" fill="#5c6672"/><circle cx="22" cy="24" r="11" fill="#2a2e35"/><g fill="#cfd6dd"><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z"/><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z" transform="rotate(60 22 24)"/><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z" transform="rotate(120 22 24)"/><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z" transform="rotate(180 22 24)"/><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z" transform="rotate(240 22 24)"/><path d="M22 24l-2.2-7.8a8.2 8.2 0 0 1 4.4 0z" transform="rotate(300 22 24)"/></g><circle cx="22" cy="24" r="3.4" fill="#8a93a3"/><rect x="35" y="18.6" width="9" height="8.8" rx="2" fill="#5c6672"/><rect x="42.6" y="16.6" width="2.6" height="12.8" rx="1" fill="#aeb6c0"/><path d="M33 33a12 12 0 0 1-4 4.4" stroke="#ff9800" stroke-width="2.2" fill="none" stroke-linecap="round"/></svg>',
+        intercooler: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M8 19v-7h8" stroke="#8a93a3" stroke-width="3.4" fill="none" stroke-linecap="round"/><path d="M40 19v-7h-8" stroke="#8a93a3" stroke-width="3.4" fill="none" stroke-linecap="round"/><rect x="10" y="17" width="28" height="17" fill="#3a4048"/><g fill="#5c6672"><rect x="12" y="17" width="2" height="17"/><rect x="16" y="17" width="2" height="17"/><rect x="20" y="17" width="2" height="17"/><rect x="24" y="17" width="2" height="17"/><rect x="28" y="17" width="2" height="17"/><rect x="32" y="17" width="2" height="17"/><rect x="36" y="17" width="2" height="17"/></g><rect x="3" y="19" width="8" height="13" rx="2" fill="#8a93a3"/><rect x="37" y="19" width="8" height="13" rx="2" fill="#8a93a3"/><rect x="3" y="19" width="8" height="3" rx="1.5" fill="#aeb6c0"/><rect x="37" y="19" width="8" height="3" rx="1.5" fill="#aeb6c0"/><g stroke="#4fc3f7" stroke-width="1.6" stroke-linecap="round"><path d="M14 5.5v3"/><path d="M18.5 4v4.5"/><path d="M23 5.5v3"/></g></svg>',
+        camshaft: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><g fill="#5c6672"><path d="M13 13c3.9 0 6.6 4.9 6.6 10.4S16.9 33.8 13 33.8 6.4 28.9 6.4 23.4 9.1 13 13 13z" transform="rotate(28 13 24)"/><path d="M24 13c3.9 0 6.6 4.9 6.6 10.4S27.9 33.8 24 33.8 17.4 28.9 17.4 23.4 20.1 13 24 13z" transform="rotate(200 24 24)"/><path d="M35 13c3.9 0 6.6 4.9 6.6 10.4S38.9 33.8 35 33.8 28.4 28.9 28.4 23.4 31.1 13 35 13z" transform="rotate(95 35 24)"/></g><rect x="2" y="21.2" width="44" height="5.6" rx="2.8" fill="#9aa3ad"/><rect x="2" y="21.2" width="44" height="2.2" rx="1.1" fill="#cfd6dd"/><g fill="#7d8794"><rect x="17.5" y="20.8" width="3.4" height="6.4" rx="1.4"/><rect x="28.5" y="20.8" width="3.4" height="6.4" rx="1.4"/><rect x="42.6" y="20.4" width="3.4" height="7.2" rx="1.6"/></g></svg>',
+        nos: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M27 8.6c8 .8 12.4 5.6 12.4 12.4" stroke="#3a4048" stroke-width="2.6" fill="none" stroke-linecap="round"/><circle cx="39.4" cy="22.6" r="2.8" fill="#5c6672"/><rect x="21" y="6" width="6" height="7" rx="1" fill="#8a93a3"/><rect x="17.6" y="3.6" width="12.8" height="3.4" rx="1.4" fill="#cfd6dd"/><rect x="14.6" y="12" width="18.8" height="31" rx="8.6" fill="#29b6f6"/><rect x="17.6" y="16" width="4" height="21" rx="2" fill="#7fd8ff"/><rect x="16" y="25.4" width="16" height="4.6" fill="#e8edf2"/><rect x="16" y="25.4" width="16" height="1.4" fill="#b7bfc7"/></svg>',
+        racingClutch: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><circle cx="24" cy="24" r="16" fill="#8a93a3"/><circle cx="24" cy="24" r="16" fill="none" stroke="#6f7780" stroke-width="1.6" stroke-dasharray="3 3"/><circle cx="24" cy="24" r="10.6" fill="#5c6672"/><g fill="#2a2e35"><circle cx="24" cy="17" r="2.6"/><circle cx="24" cy="17" r="2.6" transform="rotate(60 24 24)"/><circle cx="24" cy="17" r="2.6" transform="rotate(120 24 24)"/><circle cx="24" cy="17" r="2.6" transform="rotate(180 24 24)"/><circle cx="24" cy="17" r="2.6" transform="rotate(240 24 24)"/><circle cx="24" cy="17" r="2.6" transform="rotate(300 24 24)"/></g><circle cx="24" cy="24" r="4.6" fill="#cfd6dd"/><g stroke="#5c6672" stroke-width="1.4"><path d="M24 19.6v2.2"/><path d="M24 26.2v2.2"/><path d="M19.6 24h2.2"/><path d="M26.2 24h2.2"/></g><circle cx="24" cy="24" r="1.7" fill="#17191d"/></svg>',
+        chassis: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><rect x="5" y="11" width="38" height="7" rx="2" fill="#8a93a3"/><rect x="5" y="30" width="38" height="7" rx="2" fill="#8a93a3"/><rect x="10" y="18" width="6" height="12" fill="#6f7780"/><rect x="32" y="18" width="6" height="12" fill="#6f7780"/><g fill="#17191d"><circle cx="11.5" cy="14.5" r="2"/><circle cx="20.5" cy="14.5" r="2"/><circle cx="29.5" cy="14.5" r="2"/><circle cx="38" cy="14.5" r="2"/><circle cx="11.5" cy="33.5" r="2"/><circle cx="20.5" cy="33.5" r="2"/><circle cx="29.5" cy="33.5" r="2"/><circle cx="38" cy="33.5" r="2"/></g></svg>',
+        shortGears: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><g fill="#8a93a3"><circle cx="19" cy="30" r="9.5"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(45 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(90 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(135 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(180 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(225 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(270 19 30)"/><rect x="16.5" y="16.6" width="5" height="6" rx="1.2" transform="rotate(315 19 30)"/></g><circle cx="19" cy="30" r="3.4" fill="#17191d"/><g fill="#5c6672"><circle cx="34" cy="14" r="6.6"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1" transform="rotate(60 34 14)"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1" transform="rotate(120 34 14)"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1" transform="rotate(180 34 14)"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1" transform="rotate(240 34 14)"/><rect x="32.2" y="4.8" width="3.6" height="4.6" rx="1" transform="rotate(300 34 14)"/></g><circle cx="34" cy="14" r="2.2" fill="#17191d"/></svg>',
+        slicks: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><circle cx="24" cy="24" r="17" fill="#23262b"/><circle cx="24" cy="24" r="13.4" fill="none" stroke="#2e3238" stroke-width="1.6"/><circle cx="24" cy="24" r="9.4" fill="#8a93a3"/><g fill="#5c6672"><circle cx="24" cy="18.2" r="1.9"/><circle cx="24" cy="18.2" r="1.9" transform="rotate(72 24 24)"/><circle cx="24" cy="18.2" r="1.9" transform="rotate(144 24 24)"/><circle cx="24" cy="18.2" r="1.9" transform="rotate(216 24 24)"/><circle cx="24" cy="18.2" r="1.9" transform="rotate(288 24 24)"/></g><circle cx="24" cy="24" r="3.8" fill="#cfd6dd"/><circle cx="24" cy="24" r="1.6" fill="#17191d"/></svg>',
+        aero: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="10" width="3.6" height="20" rx="1.2" fill="#3a4048"/><path d="M7 17c8-4.6 24-5.6 36-2.8-2 4.2-6.2 6.2-12.4 7.2l-20 2.2c-2.8.2-3.8-3-3.6-6.6z" fill="#5c6672"/><path d="M9.4 16.4c8-3.8 21.6-4.8 31.2-2.6" stroke="#aeb6c0" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M15 23.4l-2.4 13" stroke="#8a93a3" stroke-width="3.4" stroke-linecap="round"/><path d="M31 21.8l-2.2 14.6" stroke="#8a93a3" stroke-width="3.4" stroke-linecap="round"/><rect x="7" y="37.6" width="34" height="3.6" rx="1.6" fill="#3a4048"/></svg>',
+        performanceGearbox: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><rect x="1.5" y="22.4" width="7" height="3.8" rx="1.6" fill="#aeb6c0"/><rect x="7" y="13" width="35" height="24" rx="3" fill="#3a4048"/><rect x="7" y="13" width="35" height="4" rx="2" fill="#4a525c"/><rect x="10" y="19.6" width="29" height="2.4" fill="#5c6672"/><rect x="10" y="28.4" width="29" height="2.4" fill="#5c6672"/><g fill="#cfd6dd"><circle cx="15" cy="20.8" r="3.7"/><circle cx="26" cy="20.8" r="3.7"/><circle cx="37" cy="20.8" r="3.7"/></g><g fill="#9aa3ad"><circle cx="20.5" cy="29.6" r="4.9"/><circle cx="31.5" cy="29.6" r="4.9"/></g><path d="M12 15.5v13" stroke="#4fc3f7" stroke-width="1.8" stroke-linecap="round"/></svg>',
+        parachute: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M4 22a20 20 0 0 1 40 0z" fill="#e53935"/><g stroke="#eceff1" stroke-width="3.2" fill="none"><path d="M24 21.6V3.4"/><path d="M16.4 21.6a15.6 15.6 0 0 1 3.4-15"/><path d="M31.6 21.6a15.6 15.6 0 0 0-3.4-15"/></g><rect x="4" y="21" width="40" height="2.4" fill="#b71c1c"/><g stroke="#cfd6dd" stroke-width="1.2" fill="none"><path d="M6.5 23.2L22.4 39"/><path d="M18 24L23.2 39"/><path d="M30 24L24.8 39"/><path d="M41.5 23.2L25.6 39"/></g><rect x="19.6" y="38.6" width="8.8" height="5.4" rx="1.4" fill="#5c6672"/><rect x="19.6" y="38.6" width="8.8" height="1.8" rx=".9" fill="#7d8794"/></svg>',
+    },
     openShop() {
         this.menuState = 'SHOP';
         document.getElementById('main-menu').classList.add('hidden');
@@ -2537,23 +3653,36 @@ const game = {
             // byte-for-byte identical to before.
             const cost = isMax ? 0 : item.cost * (isBool ? 1 : Math.max(1, lvl));
 
+/* V10G4-SHOP-ITEM-MAIN */
             const div = document.createElement('div');
             div.className = 'shop-item';
+            // Icon column + content column. The icon is INLINE SVG (no
+            // image requests, nothing to 404, no layout shift) and scales
+            // with the card through the .shop-icon clamp rules; the body
+            // keeps min-width:0 so the header can never push the icon out.
+            const iconSvg = this.SHOP_ICONS ? (this.SHOP_ICONS[item.key] || '') : '';
             div.innerHTML =
-                '<div class="shop-item-header">' +
-                    '<span style="color:#fff">' + item.name +
-                        ' <span style="color:#666">' + (isBool ? (isMax ? '✓' : '') : 'Lvl ' + lvl) + '</span>' +
-                    '</span>' +
-                    '<span style="color:' + (isMax ? '#4caf50' : (this.cash >= cost ? '#4caf50' : '#f44336')) + '">' +
-                        (isMax ? 'MAX' : '$' + cost.toLocaleString()) +
-                    '</span>' +
-                '</div>' +
-                '<div class="shop-item-detail">' + item.desc + '</div>';
+                '<div class="shop-item-main">' +
+                    (iconSvg ? '<span class="shop-icon" aria-hidden="true">' + iconSvg + '</span>' : '') +
+                    '<div class="shop-item-body">' +
+                        '<div class="shop-item-header">' +
+                            '<span style="color:#fff">' + item.name +
+                                ' <span style="color:#666">' + (isBool ? (isMax ? '✓' : '') : 'Lvl ' + lvl) + '</span>' +
+                            '</span>' +
+                            '<span style="color:' + (isMax ? '#4caf50' : (this.cash >= cost ? '#4caf50' : '#f44336')) + '">' +
+                                (isMax ? 'MAX' : '$' + cost.toLocaleString()) +
+                            '</span>' +
+                        '</div>' +
+                        '<div class="shop-item-detail">' + item.desc + '</div>' +
+                    '</div>' +
+                '</div>';
 
             div.onclick = () => {
-                if (isMax) return;
-                if (this.cash >= cost) {
-                    this.cash -= cost;
+                // Same stale-render hazard as the dealership: re-read the live
+                // level instead of trusting the one this row was built from.
+                if (isBool ? !!car.upgrades[item.key] : this._upgradeLevelAtMax(car, item)) return;
+                if (this.canAfford(cost)) {
+                    if (!this.spendCash(cost, 'upgrade:' + item.key)) return;
                     if (isBool) car.upgrades[item.key] = true;
                     // (n || 0) + 1 — guards base-0 keys missing from older saves.
                     else car.upgrades[item.key] = (car.upgrades[item.key] || 0) + 1;
@@ -2562,9 +3691,10 @@ const game = {
                     this.updateMenuUI();
                     this.openShop();
                     this.showNotification('INSTALLED');
-                    if (typeof SFX !== 'undefined') SFX.cash();
+                    if (typeof SFX !== 'undefined') SFX.purchase();
                 } else {
                     this.showNotification('INSUFFICIENT FUNDS');
+                    if (typeof SFX !== 'undefined') SFX.error();
                 }
             };
             container.appendChild(div);
@@ -2633,11 +3763,27 @@ const game = {
         ctx.restore();
     },
 
+/* V10G2-MP-NAV-FROM-ANYWHERE */
     openMultiplayerMenu() {
         this.menuState = 'MULTIPLAYER';
-        document.getElementById('main-menu').classList.add('hidden');
+        // Hide EVERY overlay, not just the main menu: invite acceptance can
+        // land here from the garage, shop, dealership or driver-profile
+        // panel — any of them left visible would sit on top of the
+        // multiplayer UI (Profile._panelOpen reads the DOM, so hiding is
+        // enough for it to resync too). (V10G2-MP-NAV-FROM-ANYWHERE)
+        document.querySelectorAll('.menu-overlay').forEach(el => el.classList.add('hidden'));
         document.getElementById('multiplayer-menu').classList.remove('hidden');
         if (typeof MP !== 'undefined') MP.resetMenu();
+    },
+
+    /* Live "is this upgrade already maxed?" read, used by the shop's click
+       handler so a second click inside the same render pass cannot push a
+       staged upgrade past its real last stage. Mirrors the render-time
+       isMax rule exactly: booleans are maxed once owned, staged parts once
+       the level reaches the item's stage count. */
+    _upgradeLevelAtMax(car, item) {
+        const lvl = (car && car.upgrades) ? (car.upgrades[item.key] || 0) : 0;
+        return item.stages === 1 ? !!lvl : lvl >= item.stages;
     },
 
     openDealership() {
@@ -2666,7 +3812,11 @@ const game = {
 
             div.onclick = () => {
                 this.previewCar = new Car({ ...def, customization: null });
-                if (isOwned) {
+                // `isOwned` was captured when the list was RENDERED. Two clicks
+                // inside one render pass would both see the stale false and buy
+                // the same car twice, so ownership is re-read from the live array
+                // at the moment of the click.
+                if (this.ownedCars.some(c => c.name === def.name)) {
                     const idx = this.ownedCars.findIndex(c => c.name === def.name);
                     if (idx >= 0) {
                         this.selectedCarIndex = idx;
@@ -2676,8 +3826,8 @@ const game = {
                     }
                     return;
                 }
-                if (this.cash >= def.price) {
-                    this.cash -= def.price;
+                if (this.canAfford(def.price)) {
+                    if (!this.spendCash(def.price, 'buy:' + def.name)) return;
                     const newCar = new Car(JSON.parse(JSON.stringify(def)));
                     this.ownedCars.push(newCar);
                     this.selectedCarIndex = this.ownedCars.length - 1;
@@ -2686,9 +3836,10 @@ const game = {
                     this.updateMenuUI();
                     this.openDealership();
                     this.showNotification('PURCHASED!');
-                    if (typeof SFX !== 'undefined') SFX.cash();
+                    if (typeof SFX !== 'undefined') SFX.purchase();
                 } else {
                     this.showNotification('INSUFFICIENT FUNDS');
+                    if (typeof SFX !== 'undefined') SFX.error();
                 }
             };
             container.appendChild(div);

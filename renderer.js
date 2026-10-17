@@ -28,20 +28,85 @@ function archWellPath(ctx, wx, wy, r, base) {
     ctx.closePath();
 }
 
+/* ── rotating-wheel sprite cache ─────────────────────────────────────
+   A wheel is a circle that only ever rotates about its own centre, so
+   its pixels are the same picture at every angle: render each distinct
+   wheel ONCE (tire face + rim + branding) at destination density and
+   blit it rotated. Rebuilt only when the wheel-affecting customization
+   (rim / tire / tireBrand) or the quantized device scale changes. */
+const WHEEL_CACHE = new WeakMap();
+function wheelSprites(car, dev) {
+    const q = Math.max(0.75, Math.min(4, Math.round(dev * 4) / 4));
+    let entry = WHEEL_CACHE.get(car);
+    const cust = car.customization || null;
+    const sig = q + '|' + (car.upgrades && car.upgrades.slicks ? 1 : 0) + '|' +
+        JSON.stringify({ rim: cust && cust.rim, tire: cust && cust.tire, tireBrand: cust && cust.tireBrand },
+            (k, v) => (typeof v === 'function' ? String(v).slice(0, 96) : v));
+    if (entry && entry.sig === sig) return entry;
+    const brand = cust?.tireBrand?.brand || null;
+    const style = cust?.rim;
+    const build = (r) => {
+        const size = Math.ceil((r + 2) * 2 * q);
+        const c = document.createElement('canvas');
+        c.width = size; c.height = size;
+        const g = c.getContext('2d');
+        g.setTransform(q, 0, 0, q, size / 2, size / 2);
+        CarArt.drawTire(g, r, r * (cust?.tire?.rimRadius || 0.68), brand);
+        if (style?.draw) style.draw(g, r * (cust?.tire?.rimRadius || 0.68), car);
+        else CarArt.drawRimFace(g, r * (cust?.tire?.rimRadius || 0.68), (style && style.id) || 'stock', car);
+        return c;
+    };
+    const tireDef = cust?.tire;
+    const art = (typeof artFor === 'function') ? artFor(car) : null;
+    const rearTire = Math.max(4, (art ? art.tireR : 10) * (tireDef?.scale ?? (car.upgrades.slicks ? 1.08 : 1)));
+    const frontTire = car.type === 'dragster' ? rearTire * 0.5 : rearTire;
+    entry = { sig, rear: build(rearTire), front: build(frontTire) };
+    WHEEL_CACHE.set(car, entry);
+    return entry;
+}
+
 function drawModernWheel(ctx, x, y, tire, rim, car) {
     const brand = car.customization?.tireBrand?.brand || null;
     ctx.save(); ctx.translate(x, y); ctx.rotate(car.wheelRotation);
+    /* Sprite path: the wheel is drawn unrotated once, then blitted UNDER
+       this frame's rotation — a rigid bitmap rotation of a circle, which
+       is pixel-equivalent to re-rasterizing the arcs. Density = the CTM
+       scale (hypot of the first column) regardless of the angle. */
+    try {
+        const m = ctx.getTransform();
+        const dev = Math.hypot(m.a, m.b) || Math.abs(m.d) || 1;
+        const spr = wheelSprites(car, dev);
+        const cust = car.customization;
+        const art = (typeof artFor === 'function') ? artFor(car) : null;
+        const rearTire = Math.max(4, (art ? art.tireR : 10) * (cust?.tire?.scale ?? (car.upgrades.slicks ? 1.08 : 1)));
+        const frontTire = car.type === 'dragster' ? rearTire * 0.5 : rearTire;
+        const isFront = Math.abs(tire - frontTire) < Math.abs(tire - rearTire);
+        const c = isFront ? spr.front : spr.rear;
+        ctx.drawImage(c, -tire - 2, -tire - 2, (tire + 2) * 2, (tire + 2) * 2);
+        ctx.restore();
+        return;
+    } catch (e) { /* fall through to the live paint */ }
     CarArt.drawTire(ctx, tire, rim, brand);
     const style = car.customization?.rim;
-    // Rim draws receive the car so a RIM PAINT selection ('accent' rides
-    // secondaryColor; explicit finishes pass their hex) can override the
-    // style's own default finish.
     if (style?.draw) style.draw(ctx, rim, car);
     else CarArt.drawRimFace(ctx, rim, (style && style.id) || 'stock', car);
     ctx.restore();
 }
 
-function renderModernCar(ctx, car, c, s, glass) {
+/* Painted fender lips restore the arch edge in front of the tires.
+   Straddling the arch radius (not sitting inside it) is what makes the
+   lip read as rolled sheet metal rather than a ring painted on the tire.
+   Shared by the live painter and the sprite-cache "over" layer. */
+function paintFenderLips(ctx, art, wy, wyF, c) {
+    for (const [wx, wyy] of [[art.wheels[0][0], wy], [art.wheels[1][0], wyF]]) {
+        ctx.strokeStyle = c; ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.arc(wx, wyy, art.arch, Math.PI, Math.PI * 2); ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 0.55;
+        ctx.beginPath(); ctx.arc(wx, wyy, art.arch - 0.75, Math.PI * 1.08, Math.PI * 1.62); ctx.stroke();
+    }
+}
+
+function renderModernCar(ctx, car, c, s, glass, layer) {
     const art = artFor(car);
     if (!art) return;
     const tireDef = car.customization?.tire;
@@ -57,8 +122,8 @@ function renderModernCar(ctx, car, c, s, glass) {
     const midX = (art.rear + art.front) / 2;
 
     car._artAnchors = {
-        rearWheel: { x: art.wheels[0][0], y: wy, r: rearTire },
-        frontWheel: { x: art.wheels[1][0], y: wyF, r: frontTire },
+        rearWheel: { x: art.wheels[0][0], y: wy, r: rearTire, rim: rearTire * rimFactor },
+        frontWheel: { x: art.wheels[1][0], y: wyF, r: frontTire, rim: frontTire * rimFactor },
         exhaust: { x: art.rear + 1.5, y: art.rocker - 4 },
         spoiler: { x: art.deck[0], y: art.deck[1], w: art.deck[2] },
         kit: {
@@ -68,6 +133,11 @@ function renderModernCar(ctx, car, c, s, glass) {
         },
         livery: { x: Math.max(4, art.rear + 6), y: art.belt, w: Math.max(36, art.front - art.rear - 12), h: art.rocker - art.belt },
     };
+
+    if (layer === 'over') {   // sprite-cache layer 2: lips only
+        paintFenderLips(ctx, art, wy, wyF, c);
+        return;
+    }
 
     /* 1 ── contact shadow */
     const shadow = ctx.createRadialGradient(midX, art.ground - 1, 6, midX, art.ground - 1, (art.front - art.rear) * .58);
@@ -164,8 +234,20 @@ function renderModernCar(ctx, car, c, s, glass) {
     ctx.lineTo(art.wheels[1][0] - art.arch + 2.4, art.belt - 2.2);
     ctx.lineTo(art.wheels[1][0] - art.arch + 2.4, art.belt - 0.2);
     ctx.closePath(); ctx.fill();
-    ctx.fillStyle = 'rgba(0,0,0,.55)';
-    ctx.beginPath(); ctx.arc(art.wheels[0][0] - 4, art.belt - 1.6, 1.1, 0, Math.PI * 2); ctx.fill();
+    /* The fuel filler used to be a bare black dot at (rearAxle - 4,
+       belt - 1.6). That y is ABOVE the beltline, so on every car it landed up
+       on the rear glass as a detached black speck — a blemish, not a detail.
+       Drawn instead as a small body-coloured flap with a shut line, seated on
+       the rear quarter panel just behind the door. */
+    {
+        const fx = art.wheels[0][0] - 4, fy = art.belt + 2.2;
+        ctx.fillStyle = c;
+        ctx.fillRect(fx, fy, 3.2, 2.6);
+        ctx.strokeStyle = 'rgba(10,14,19,.45)'; ctx.lineWidth = 0.5;
+        ctx.strokeRect(fx, fy, 3.2, 2.6);
+        ctx.fillStyle = 'rgba(255,255,255,.22)';
+        ctx.fillRect(fx, fy, 3.2, 0.6);
+    }
 
     /* 9 ── lamps, clipped to the body so a curved nose or tail can never
        leave a lamp floating in the background */
@@ -204,19 +286,20 @@ function renderModernCar(ctx, car, c, s, glass) {
     if (car.customization?.spoiler?.draw) car.customization.spoiler.draw(ctx, car);
     if (car.customization?.exhaust?.draw) car.customization.exhaust.draw(ctx, car);
 
-    /* 11 ── wheels */
+    if (layer === 'under') return;   // sprite-cache layer 1 ends here — wheels draw live
     drawModernWheel(ctx, art.wheels[0][0], wy, rearTire, rearTire * rimFactor, car);
     drawModernWheel(ctx, art.wheels[1][0], wyF, frontTire, frontTire * rimFactor, car);
 
     /* 12 ── painted fender lips restore the arch edge in front of the tires.
        Straddling the arch radius (not sitting inside it) is what makes the
-       lip read as rolled sheet metal rather than a ring painted on the tire. */
-    for (const [wx, wyy] of [[art.wheels[0][0], wy], [art.wheels[1][0], wyF]]) {
-        ctx.strokeStyle = c; ctx.lineWidth = 1.6;
-        ctx.beginPath(); ctx.arc(wx, wyy, art.arch - 0.8, Math.PI, Math.PI * 2); ctx.stroke();
-        ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 0.55;
-        ctx.beginPath(); ctx.arc(wx, wyy, art.arch - 1.9, Math.PI * 1.08, Math.PI * 1.62); ctx.stroke();
-    }
+       lip read as rolled sheet metal rather than a ring painted on the tire.
+
+       The lip is centred ON art.arch, never inside it. It used to be stroked
+       at arch - 0.8, which was tuned when the arch stood 12% proud of the
+       tire. Once the arch was tightened to 5% that offset put the stroke's
+       inner edge below the top of the tread, so the body-coloured lip painted
+       across the upper sidewall and hid the tire branding underneath. */
+    paintFenderLips(ctx, art, wy, wyF, c);
 
     if (car.upgrades.parachute && car.speed < 10 && car.type !== 'hatch') {
         ctx.fillStyle = '#aeb5bb'; ctx.beginPath(); ctx.arc(art.rear - 6, art.belt, 5, 0, Math.PI * 2); ctx.fill();
@@ -274,11 +357,52 @@ const Renderer = {
         const followOffset = Math.min(W * 0.34, 220);
         const camX = Math.max(0, playerCar.x * METERS_TO_PX - followOffset);
 
+        /* Car size is set HERE, by the car scale, and deliberately not by
+           cameraZoom. Zooming the camera would also scale the road markings,
+           the distance text and the start gantry, all of which are laid out
+           against the fixed HUD and would drift or clip. Sizing the cars
+           alone changes exactly one thing: how much of the frame the hero car
+           occupies.
+
+           Every silhouette in car-art.js is authored nose-to-tail as exactly
+           100 units, so the on-screen width is CAR_ART_LEN * scale * zoom.
+
+           CAR_SIZE_MULT is the one knob for how large the hero car reads. It
+           was measured at 1.68 (148px -> 248px, 11.6% -> 19.4% of a 1280px
+           viewport) and came back as too big on screen, so it is 1.0 here:
+           the original 148px. Nudge this single number to taste — 1.15 is a
+           reasonable middle if it reads small again.
+
+           Responsive rather than fixed: it grows with the viewport up to a
+           sane cap so the car stays legible on a 4K monitor instead of
+           shrinking to a speck, and it is floored so phone layouts — where
+           the car already filled a third of the screen — do not change. */
+        const CAR_ART_LEN = 100;
+        const CAR_SIZE_MULT = 1.0;
+        // The responsive term is calibrated so CAR_SIZE_MULT = 1.0 reproduces
+        // the original 1.1 car scale at 1280px exactly, and only deviates from
+        // there on a wider or narrower viewport.
+        const playerScale = Math.min(1.6, Math.max(1.1, W / 1160)) * CAR_SIZE_MULT;
+        const oppScale = playerScale * (0.95 / 1.1);   // keeps the old 0.95:1.1 ratio
+
         const pX = (playerCar.x * METERS_TO_PX) - camX + 40;
         const oX = (opponentCar.x * METERS_TO_PX) - camX + 40;
 
-        const playerLaneY = roadY + 65;
-        const oppLaneY = roadY + 20;
+        /* Lanes are positioned by where the CONTACT PATCH lands, not by the
+           art anchor, so a bigger car grows UP out of the road instead of
+           sinking down through the dashboard.
+
+           The player's contact patch stays exactly where it always was
+           (roadY + 116.7 = the old 65 + 47*1.10): the dashboard is drawn over
+           the bottom of the frame, so any lower and the car hides behind it.
+           The gap to the opponent is one car-height, which keeps a clear band
+           of road between the two cars at ANY size — at CAR_SIZE_MULT 1.0 it
+           works out to the original 52 units, so this is a no-op until the
+           multiplier is raised. */
+        const playerGround = roadY + 116.7;
+        const oppGround = playerGround - 47 * playerScale;
+        const playerLaneY = playerGround - 47 * playerScale;
+        const oppLaneY = oppGround - 47 * oppScale;
 
         // The zoom anchors on the PLAYER'S CAR, not a fixed screen point.
         // While following, camX tracks the car so pX never moves and this is
@@ -287,7 +411,7 @@ const Renderer = {
         // far-away focus point used to multiply that distance and push the
         // car's rear half off-screen. Anchoring on the car keeps it fully
         // visible in every mode, at every speed.
-        const focusX = pX + 52 * 1.1 * 0.5, focusY = roadY + 58;
+        const focusX = pX + CAR_ART_LEN * 0.5 * playerScale, focusY = roadY + 58;
         ctx.save();
         ctx.translate(focusX, focusY); ctx.scale(cameraZoom, cameraZoom); ctx.translate(-focusX, -focusY);
         game.drawBackground(ctx, W, H, camX); // Delegated to game for background state
@@ -315,8 +439,8 @@ const Renderer = {
 
         if (effects) effects.draw();
 
-        this.drawCar(ctx, opponentCar, oX, oppLaneY, 0.95);
-        this.drawCar(ctx, playerCar, pX, playerLaneY, 1.1);
+        this.drawCar(ctx, opponentCar, oX, oppLaneY, oppScale);
+        this.drawCar(ctx, playerCar, pX, playerLaneY, playerScale);
 
         ctx.restore();
         this.drawDashboard(ctx, W, H, playerCar, raceState);
@@ -669,13 +793,79 @@ const Renderer = {
         ctx.restore();
     },
 
+    /* ── car sprite cache ────────────────────────────────────────────
+       Two offscreen layers per car (see file header). Rebuilt only when
+       the paint/parts signature or the quantized device scale changes;
+       keyed per car instance in a WeakMap so swapped-out cars release
+       their sprites automatically. */
+    _carCache: new WeakMap(),
+    carSprites(car, dev) {
+        const q = Math.max(0.75, Math.min(4, Math.round(dev * 4) / 4));
+        let entry = this._carCache.get(car);
+        const sig = car.name + '|' + car.color + '|' + car.secondaryColor + '|' +
+            (car.upgrades ? car.upgrades.engine : 0) + '|' + q + '|' +
+            JSON.stringify(car.customization || null, (k, v) => (typeof v === 'function' ? String(v).slice(0, 96) : v));
+        if (entry && entry.sig === sig) return entry;
+        const art = artFor(car);
+        if (!art) return null;
+        const glass = car.customization?.tint?.color || '#1a2332';
+        const M = 18;   // car-space margin: spoilers, mirrors and kit overshoot
+        const ox = art.rear - M, oy = art.topY - M;
+        const wU = (art.front - art.rear) + M * 2;
+        const hU = (art.ground + M) - oy;
+        const under = document.createElement('canvas');
+        under.width = Math.ceil(wU * q); under.height = Math.ceil(hU * q);
+        const uc = under.getContext('2d');
+        uc.setTransform(q, 0, 0, q, -ox * q, -oy * q);
+        renderModernCar(uc, car, car.color, car.secondaryColor, glass, 'under');
+        const over = document.createElement('canvas');
+        over.width = under.width; over.height = under.height;
+        const oc = over.getContext('2d');
+        oc.setTransform(q, 0, 0, q, -ox * q, -oy * q);
+        renderModernCar(oc, car, car.color, car.secondaryColor, glass, 'over');
+        entry = { sig, under, over, ox, oy, wU, hU };
+        this._carCache.set(car, entry);
+        return entry;
+    },
+
     drawCar(ctx, car, x, y, scale = 1) {
         ctx.save();
         ctx.translate(x, y + car.squat);
         ctx.scale(scale, scale);
 
-        // Contact shadow sits on the shared ground line (y=47 in car space),
-        // not on the old hard-coded 42 — the cars are planted lower now.
+        let spr = null;
+        try {
+            // Device density under the CURRENT transform (dpr × cameraZoom ×
+            // car scale) — the sprite is built at exactly this resolution so
+            // a sprite pixel lands on a device pixel: no blur, no waste.
+            const m = ctx.getTransform();
+            spr = this.carSprites(car, Math.abs(m.a) || 1);
+        } catch (e) { spr = null; }
+
+        if (spr) {
+            if (car.isGhost) ctx.globalAlpha = 0.34;   // spectral replay, dimmed on the car
+            ctx.drawImage(spr.under, spr.ox, spr.oy, spr.wU, spr.hU);
+            // The wheels still turn: drawn live between the two layers.
+            const a = car._artAnchors;
+            if (a && a.rearWheel) {
+                drawModernWheel(ctx, a.rearWheel.x, a.rearWheel.y, a.rearWheel.r, a.rearWheel.rim, car);
+                drawModernWheel(ctx, a.frontWheel.x, a.frontWheel.y, a.frontWheel.r, a.frontWheel.rim, car);
+            }
+            ctx.drawImage(spr.over, spr.ox, spr.oy, spr.wU, spr.hU);
+            // Dynamic extras the cache must NOT freeze: parachute (speed-gated)
+            if (car.upgrades.parachute && car.speed < 10 && car.type !== 'hatch') {
+                ctx.fillStyle = '#aeb5bb'; ctx.beginPath(); ctx.arc(artFor(car) ? artFor(car).rear - 6 : -6, car._artAnchors ? (artFor(car).belt || 20) : 20, 5, 0, Math.PI * 2); ctx.fill();
+                ctx.strokeStyle = '#6d757c'; ctx.lineWidth = 0.6; ctx.stroke();
+            }
+            // Nitrous purge flame rides the exhaust while the bottle ACTUALLY
+            // sprays (drawn here, not in the shared particle system, so gear
+            // backfires stay orange and the spray reads as its own thing).
+            if (car.nosSpraying) this.drawNosFlame(ctx, car);
+            ctx.restore();
+            return;
+        }
+
+        /* Fallback (art definition missing): the original full live paint. */
         const shadowGrad = ctx.createRadialGradient(48, 46, 10, 48, 46, 60);
         shadowGrad.addColorStop(0, 'rgba(0,0,0,0.5)');
         shadowGrad.addColorStop(0.6, 'rgba(0,0,0,0.2)');
@@ -684,26 +874,15 @@ const Renderer = {
         ctx.beginPath();
         ctx.ellipse(48, 46, 58, 7, 0, 0, Math.PI * 2);
         ctx.fill();
-
         const c = car.color;
         const s = car.secondaryColor;
         const glass = car.customization?.tint?.color || '#1a2332';
-        // (`dark` and `rim` used to be declared here for the legacy
-        // silhouette drawing that sat after an unconditional `return`.
-        // That block is gone; these were its only consumers.)
-
         if (car.isGhost) {
-            // A spectral replay — dimmed directly ON the car (no aura box,
-            // no outline) so it reads as "not really there" next to the
-            // solid player car without shouting for attention.
             ctx.globalAlpha = 0.34;
             renderModernCar(ctx, car, c, s, glass);
         } else {
             renderModernCar(ctx, car, c, s, glass);
         }
-        // Nitrous purge flame rides the exhaust while the bottle ACTUALLY
-        // sprays (drawn here, not in the shared particle system, so gear
-        // backfires stay orange and the spray reads as its own thing).
         if (car.nosSpraying) this.drawNosFlame(ctx, car);
         ctx.restore();
         return;

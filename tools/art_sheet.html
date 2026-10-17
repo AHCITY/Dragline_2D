@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<!--
+  art_sheet.html  -  dev-only contact sheet for the car art.
+
+  Loads the REAL car-art.js and renderer.js (the same files the game loads) and
+  calls renderModernCar() directly, so what you see here is what the game draws.
+  It exists to answer three questions with evidence instead of vibes:
+
+    ?sheet=cars1   first 4 silhouettes, big
+    ?sheet=cars2   last 4 silhouettes, big
+    ?sheet=spoil   every spoiler kind, zoomed on the rear deck
+    ?sheet=exh     every exhaust kind, zoomed on the rear bumper
+    ?sheet=arch    wheel/arch fit, zoomed hard on one arch
+    ?sheet=tire    sidewall lettering, zoomed hard on a tire
+
+  Not shipped. Nothing in index.html references this file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>art sheet</title>
+<style>
+  html,body { margin:0; background:#0a0b0d; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script src="../car-art.js"></script>
+<script src="../renderer.js"></script>
+<script>
+'use strict';
+
+/* car-art.js's part drawers call artAnchor(), which lives in game.js. In the
+   full game every script has loaded before the first draw, so it resolves off
+   the global object; this sheet deliberately does NOT load game.js (it would
+   boot the whole game), so mirror that one helper here instead. */
+function artAnchor(car, key) { return car._artAnchors?.[key] || { x: 3, y: 27, w: 14 }; }
+
+const SHEET = (location.search.match(/sheet=([a-z0-9]+)/i) || [])[1] || 'cars1';
+
+const CARTS = [
+    { art: 'civic_ek',     name: "Civic '99",      color: '#3f7fd0' },
+    { art: 's14',          name: 'S14 Drift',      color: '#9aa6b2' },
+    { art: 'mustang_sn95', name: 'Mustang GT',     color: '#c8452e' },
+    { art: 'r34',          name: 'R34 GTR',        color: '#5a6470' },
+    { art: 'supra_a80',    name: 'Supra Mk4',      color: '#d8a52c' },
+    { art: 'viper_acr',    name: 'Viper ACR',      color: '#2f9c58' },
+    { art: 'huracan',      name: 'Huracan',        color: '#e0b23a' },
+    { art: 'funny_car',    name: 'Funny Car',      color: '#b03fd0' },
+];
+
+const TIRES = [
+    { id: 'street',      name: 'street',      scale: 1.00, rimRadius: 0.68 },
+    { id: 'sport',       name: 'sport',       scale: 1.04, rimRadius: 0.74 },
+    { id: 'low_profile', name: 'low-profile', scale: 0.95, rimRadius: 0.80 },
+    { id: 'drift',       name: 'drift',       scale: 1.08, rimRadius: 0.70 },
+    { id: 'slick',       name: 'slick',       scale: 1.08, rimRadius: 0.58 },
+];
+
+function makeCar(def, custom) {
+    return {
+        art: def.art, type: 'modern', name: def.name,
+        color: def.color, secondaryColor: '#c8452e',
+        wheelRotation: 0, speed: 0, squat: 0,
+        upgrades: { engine: 0, slicks: false, parachute: false },
+        customization: Object.assign({
+            tire: TIRES[0], tireBrand: { brand: 'BRIDGESTONE' },
+            rim: { id: 'five_spoke', draw: (ctx, r, c) => CarArt.drawRimFace(ctx, r, 'five_spoke', c) },
+            rimPaint: { id: 'stock' },
+            tint: { id: 'stock' },
+            livery: null, spoiler: null, bodyKit: null, exhaust: null,
+        }, custom || {}),
+    };
+}
+
+/* ── drawing helpers ─────────────────────────────────────────────── */
+
+function fit(ctx, art, cx, cy, cw, ch, padPx) {
+    const x0 = art.rear - 10, x1 = art.front + 10;
+    const y0 = art.topY - 8, y1 = art.ground + 8;
+    const s = Math.min(cw / (x1 - x0), ch / (y1 - y0)) - padPx;
+    ctx.save();
+    ctx.translate(cx - (x0 + x1) / 2 * s, cy - (y0 + y1) / 2 * s);
+    ctx.scale(s, s);
+    return s;
+}
+
+/* Draw car-local coords x0..x1 / y0..y1 into the rect, filling it. */
+function zoom(ctx, car, rx0, ry0, rx1, ry1, cx, cy, cw, ch) {
+    const s = Math.min(cw / (rx1 - rx0), ch / (ry1 - ry0));
+    ctx.save();
+    ctx.beginPath(); ctx.rect(cx, cy, cw, ch); ctx.clip();
+    ctx.translate(cx - rx0 * s, cy - ry0 * s);
+    ctx.scale(s, s);
+    renderModernCar(ctx, car, car.color, 1, 'rgba(150,200,230,.5)');
+    ctx.restore();
+    return s;
+}
+
+function label(ctx, x, y, main, sub) {
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#e8eaed';
+    ctx.font = 'bold 20px "Press Start 2P", monospace';
+    ctx.fillText(main, x, y);
+    if (sub) {
+        ctx.fillStyle = '#8b949e';
+        ctx.font = '13px "Press Start 2P", monospace';
+        ctx.fillText(sub, x, y + 18);
+    }
+}
+
+function groundLine(ctx, s, ox, oy, art, x0, x1) {
+    /* a faint road line so wheel contact is judgeable */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120,150,180,.30)'; ctx.lineWidth = 1 / s;
+    ctx.beginPath();
+    ctx.moveTo(ox + (x0 - art.rear - 20) * s, oy + (art.ground) * s);
+    ctx.lineTo(ox + (x1 - art.rear + 20) * s, oy + (art.ground) * s);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function panel(ctx, x, y, w, h, title) {
+    ctx.fillStyle = '#101216';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1;
+    ctx.strokeRect(x + .5, y + .5, w - 1, h - 1);
+    if (title) label(ctx, x + 12, y + 22, title);
+}
+
+/* ── sheets ──────────────────────────────────────────────────────── */
+
+function sheetCars(list, W, H) {
+    const cellH = (H - 60) / list.length;
+    list.forEach((def, i) => {
+        const y = 50 + i * cellH;
+        panel(ctx, 20, y, W - 40, cellH - 10);
+        const car = makeCar(def);
+        const art = CarArt.artFor(car);
+        const s = fit(ctx, art, 20 + (W - 40) / 2, y + (cellH - 10) / 2, W - 40, cellH - 10, 0.06);
+        renderModernCar(ctx, car, def.color, 1, 'rgba(150,200,230,.5)');
+        ctx.restore();
+        /* measurements, printed so they can be checked by eye against the
+           reference rather than guessed at */
+        const len = art.front - art.rear;
+        label(ctx, 34, y + 24, def.name,
+            'len ' + len.toFixed(1) + '  h ' + art.height.toFixed(1) +
+            '  h/l ' + (art.height / len).toFixed(3) +
+            '  tireR ' + art.tireR.toFixed(2) +
+            '  arch ' + art.arch.toFixed(2) +
+            '  gap ' + ((art.arch - art.tireR) / art.tireR * 100).toFixed(0) + '%');
+    });
+}
+
+function sheetSpool(W, H) {
+    const kinds = [
+        ['none', 'none'], ['lip', 'lip'], ['ducktail', 'ducktail'],
+        ['pedestal', 'pedestal'], ['gt_wing', 'GT wing'], ['race_wing', 'race wing'],
+    ];
+    const cols = 3, rows = 2;
+    const cw = (W - 40) / cols, ch = (H - 60) / rows;
+    kinds.forEach((k, i) => {
+        const x = 20 + (i % cols) * cw, y = 50 + Math.floor(i / cols) * ch;
+        panel(ctx, x, y, cw - 10, ch - 10);
+        const def = CARTS[1];
+        const car = makeCar(def, k[0] === 'none' ? {} :
+            { spoiler: { draw: (c, cc) => CarArt.drawSpoilerPart(c, cc, k[1]) } });
+        const art = CarArt.artFor(car);
+        /* whole car for context, then a zoom strip on the deck */
+        ctx.save();
+        fit(ctx, art, x + (cw - 10) / 2, y + (ch - 10) / 2, cw - 10, ch - 10, 0.06);
+        renderModernCar(ctx, car, def.color, 1, 'rgba(150,200,230,.5)');
+        ctx.restore();
+        label(ctx, x + 12, y + 24, k[1]);
+    });
+    /* big zooms of the two most important wings */
+    const def = CARTS[1];
+    ['gt', 'pedestal', 'race'].forEach((kind, i) => {
+        const car = makeCar(def, { spoiler: { draw: (c, cc) => CarArt.drawSpoilerPart(c, cc, kind) } });
+        const art = CarArt.artFor(car);
+        const x = 20 + i * ((W - 40) / 3), y = H - 300;
+        panel(ctx, x, y, (W - 40) / 3 - 10, 280, kind);
+        zoom(ctx, car, art.rear - 4, art.belt - 16, art.rear + 46, art.rocker - 2,
+             x + 10, y + 40, (W - 40) / 3 - 30, 230);
+    });
+}
+
+function sheetExhaust(W, H) {
+    const kinds = [['stock', 'none'], ['single', 'single'], ['dual', 'dual'],
+                   ['quad', 'quad'], ['side', 'side pipe']];
+    const cw = (W - 40) / 3;
+    const trace = [];
+    trace.push('drawExhaustPart=' + (typeof CarArt.drawExhaustPart) +
+               ' drawSpoilerPart=' + (typeof CarArt.drawSpoilerPart));
+    kinds.forEach((k, i) => {
+     try {
+        const x = 20 + (i % 3) * cw, y = 50 + Math.floor(i / 3) * ((H - 60) / 2);
+        panel(ctx, x, y, cw - 10, (H - 60) / 2 - 10, k[1]);
+        const def = CARTS[1];
+        const car = makeCar(def, k[0] === 'stock' ? {} :
+            { exhaust: { draw: (c, cc) => CarArt.drawExhaustPart(c, cc, k[1]) } });
+        const art = CarArt.artFor(car);
+        /* Zoom the rear lower corner. The exhaust must sit BELOW the rocker
+           line - that line is drawn explicitly so misplacement is obvious. */
+        zoom(ctx, car, art.rear - 4, art.rocker - 22, art.rear + 40, art.ground + 5,
+             x + 10, y + 40, cw - 30, (H - 60) / 2 - 60);
+        trace.push('cell ' + i + ' (' + k[1] + ') ok');
+        const s = 1;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,80,80,.85)'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]);
+        ctx.beginPath();
+        const px = x + 10, py = y + 40, pw = cw - 30, ph = (H - 60) / 2 - 60;
+        const zx0 = art.rear - 4, zy0 = art.rocker - 22;
+        const zx1 = art.rear + 40, zy1 = art.ground + 5;
+        const zs = Math.min(pw / (zx1 - zx0), ph / (zy1 - zy0));
+        const ox = px - zx0 * zs, oy = py - zy0 * zs;
+        ctx.moveTo(ox, oy + art.rocker * zs); ctx.lineTo(ox + pw + 40, oy + art.rocker * zs);
+        ctx.moveTo(ox, oy + art.ground * zs); ctx.lineTo(ox + pw + 40, oy + art.ground * zs);
+        ctx.stroke();
+        ctx.restore();
+     } catch (e) {
+        trace.push('cell ' + i + ' (' + k[1] + ') THREW: ' + e.message);
+     }
+    });
+    /* Only surface the trace when something actually failed, so a healthy
+       sheet stays clean. */
+    if (trace.some(t => t.indexOf('THREW') >= 0)) {
+        ctx.fillStyle = '#ff5555'; ctx.font = '13px monospace';
+        trace.forEach((t, n) => ctx.fillText(t, 20, H - 130 + n * 16));
+    }
+}
+
+function sheetArch(W, H) {
+    const cells = 4, cw = (W - 40) / cells;
+    const defs = [CARTS[0], CARTS[1], CARTS[2], CARTS[5]];
+    defs.forEach((def, i) => {
+        const x = 20 + i * cw, y = 50;
+        panel(ctx, x, y, cw - 10, (H - 60) / 2 - 10, def.name);
+        const car = makeCar(def);
+        const art = CarArt.artFor(car);
+        const ax = art.wheels[0][0];
+        zoom(ctx, car, ax - art.arch * 1.7, art.ground - art.tireR * 2.9,
+             ax + art.arch * 1.7, art.ground + 3,
+             x + 10, y + 46, cw - 30, (H - 60) / 2 - 66);
+    });
+    /* same arch again with the biggest available tire */
+    defs.forEach((def, i) => {
+        const x = 20 + i * cw, y = 50 + (H - 60) / 2;
+        panel(ctx, x, y, cw - 10, (H - 60) / 2 - 10, def.name + ' + slick');
+        const car = makeCar(def, { tire: TIRES[4] });
+        const art = CarArt.artFor(car);
+        const ax = art.wheels[0][0];
+        const tr = art.tireR * TIRES[4].scale;
+        zoom(ctx, car, ax - art.arch * 1.7, art.ground - tr * 2.9,
+             ax + art.arch * 1.7, art.ground + 3,
+             x + 10, y + 46, cw - 30, (H - 60) / 2 - 66);
+    });
+}
+
+/* ── race view, measured ─────────────────────────────────────────────
+   The HUD/dashboard/lights are stubbed to no-ops for the measurement pass
+   so the ONLY saturated pixels left in the frame are the cars. That makes
+   the bounding box an exact reading of where the car actually lands, not a
+   number re-derived from the same constants the drawing code used. */
+function sheetRace(W, H) {
+    const isMobile = W < 700;
+    window.game = {
+        _controlReserve: 0,
+        _hudColor: (c, d) => d,
+        drawBackground(ctx2, w2, h2, camX) {
+            /* Flat neutral sky on purpose: the measurement pass below isolates
+               the cars by colour saturation, and a blue sky would swamp the
+               result. The car footprint is what is being measured here. */
+            ctx2.fillStyle = '#2e3136';
+            ctx2.fillRect(0, 0, w2, h2);
+        },
+    };
+    const playerCar = makeCar(CARTS[1]);  playerCar.x = 0;   playerCar.speed = 0;
+    const oppCar = makeCar(CARTS[2]);     oppCar.x = 12;     oppCar.speed = 0;
+
+    const measure = document.createElement('canvas');
+    measure.width = W; measure.height = H;
+    const mctx = measure.getContext('2d');
+    /* Two separate measurement passes. Splitting the lanes by scanning for an
+       empty row band used to work when the cars were 148px and clearly
+       separated; once they grew, their bounding rows touched and the split
+       collapsed and reported the COMBINED width of both cars as if it were
+       one. Rendering each car alone removes the assumption entirely — the
+       answer is then just the bounding box of one car, whatever size it is. */
+    const mkCanvas = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
+    const empty = mkCanvas();  const ectx = empty.getContext('2d');
+
+    const realDash = Renderer.drawDashboard, realBar = Renderer.drawProgressBar,
+          realLights = Renderer.drawStartLights, realCar = Renderer.drawCar;
+    Renderer.drawDashboard = () => {}; Renderer.drawProgressBar = () => {};
+    Renderer.drawStartLights = () => {};
+
+    /* Render `only` (a car) with everything else stubbed away, and diff. */
+    const shotFor = (only) => {
+        Renderer.drawCar = (c2, car, x, y, sc) => { if (car === only) realCar.call(Renderer, c2, car, x, y, sc); };
+        const cv = mkCanvas();
+        try { Renderer.drawRaceScene(cv.getContext('2d'), W, H, playerCar, oppCar, null, 0, 800, 8, null, null, isMobile); }
+        catch (e) { ctx.fillStyle = '#ff5555'; ctx.font = '16px monospace'; ctx.fillText('drawRaceScene threw: ' + e.message, 30, 300); }
+        Renderer.drawCar = realCar;
+        return cv;
+    };
+    try {
+        Renderer.drawCar = () => {};                      /* baseline: cars absent */
+        Renderer.drawRaceScene(ectx, W, H, playerCar, oppCar, null, 0, 800, 8, null, null, isMobile);
+    } catch (e) {
+        ctx.fillStyle = '#ff5555'; ctx.font = '16px monospace';
+        ctx.fillText('drawRaceScene threw: ' + e.message, 30, 40);
+    }
+    const playerShot = shotFor(playerCar);
+    const oppShot = shotFor(oppCar);
+    mctx.drawImage(playerShot, 0, 0);
+    ctx.drawImage(oppShot, W / 2, 0, W / 2, H);
+    Renderer.drawDashboard = realDash; Renderer.drawProgressBar = realBar;
+    Renderer.drawStartLights = realLights; Renderer.drawCar = realCar;
+
+    /* Bounding box of ONE car's pixels: anything the frame differs from the
+       car-absent baseline. Exact and colour-independent, so a silver car is
+       measured as reliably as a red one. */
+    const bboxOf = (cv) => {
+        const d = cv.getContext('2d').getImageData(0, 0, W, H).data;
+        const b = ectx.getImageData(0, 0, W, H).data;
+        const hit = (x, y) => {
+            const i = (y * W + x) * 4;
+            return Math.abs(d[i] - b[i]) + Math.abs(d[i + 1] - b[i + 1]) +
+                   Math.abs(d[i + 2] - b[i + 2]) > 12;
+        };
+        let x0 = W, x1 = -1, y0 = H, y1 = -1;
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            if (hit(x, y)) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+        }
+        return x1 < 0 ? null : { x0, x1, y0, y1, w: x1 - x0, h: y1 - y0 };
+    };
+    const pc = bboxOf(playerShot);
+    const oc = bboxOf(oppShot);
+    cvs.getContext('2d').drawImage(playerShot, 0, 0);
+    const lab = (b, ox, tag) => {
+        if (!b) return tag + ' not found';
+        return tag + ' ' + b.w + 'px (' + (b.w / W * 100).toFixed(1) + '%)  h=' + b.h +
+               '  y ' + b.y0 + '-' + b.y1;
+    };
+    if (pc) {
+        ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 2;
+        ctx.strokeRect(pc.x0, pc.y0, pc.w, pc.h);
+    }
+    if (oc) {
+        ctx.strokeStyle = '#ffaa22'; ctx.lineWidth = 2;
+        ctx.strokeRect(oc.x0 + W / 2, oc.y0, oc.w, oc.h);
+    }
+    panel(ctx, 20, 20, W - 40, 96, 'race view - measured car footprint');
+    label(ctx, 36, 74, lab(pc, 0, 'player'), 'target ~250px on 1280 = ~20%   ' + lab(oc, W / 2, 'opponent'));
+}
+
+function sheetTire(W, H) {
+    const cells = 4, cw = (W - 40) / cells;
+    const set = [
+        [{ tire: TIRES[0] }, 'street 0.68'],
+        [{ tire: TIRES[1] }, 'sport 0.74'],
+        [{ tire: TIRES[2] }, 'low 0.80'],
+        [{ tire: TIRES[3] }, 'drift 0.70'],
+    ];
+    set.forEach((c, i) => {
+        const x = 20 + i * cw;
+        panel(ctx, x, 50, cw - 10, (H - 60) - 10, c[1]);
+        const def = CARTS[1];
+        const car = makeCar(def, c[0]);
+        const art = CarArt.artFor(car);
+        const tr = art.tireR * c[0].tire.scale;
+        const ax = art.wheels[0][0];
+        zoom(ctx, car, ax - tr * 1.35, art.ground - tr * 2.4,
+             ax + tr * 1.35, art.ground + tr * 0.2,
+             x + 10, 96, cw - 30, (H - 60) - 56);
+    });
+}
+
+/* ── go ──────────────────────────────────────────────────────────── */
+
+const SIZES = {
+    cars1: [1500, 1150], cars2: [1500, 1150], spoil: [1500, 1250],
+    exh: [1500, 900], arch: [1500, 1150], tire: [1500, 720], race: [1280, 720],
+};
+const [W, H] = SIZES[SHEET] || SIZES.cars1;
+const dpr = 1;                      /* render 1:1 so the screenshot is the truth */
+const cvs = document.getElementById('c');
+cvs.width = W; cvs.height = H;
+cvs.style.width = W + 'px'; cvs.style.height = H + 'px';
+const ctx = cvs.getContext('2d');
+ctx.fillStyle = '#0a0b0d'; ctx.fillRect(0, 0, W, H);
+ctx.textBaseline = 'alphabetic';
+
+try {
+    if (SHEET === 'cars1') sheetCars(CARTS.slice(0, 4), W, H);
+    else if (SHEET === 'cars2') sheetCars(CARTS.slice(4, 8), W, H);
+    else if (SHEET === 'spoil') sheetSpool(W, H);
+    else if (SHEET === 'exh') sheetExhaust(W, H);
+    else if (SHEET === 'arch') sheetArch(W, H);
+    else if (SHEET === 'tire') sheetTire(W, H);
+    else if (SHEET === 'race') sheetRace(W, H);
+    document.title = 'sheet:' + SHEET + ' ok';
+} catch (err) {
+    /* Surface the failure in the title so --dump-dom can read it: a silent
+       canvas exception otherwise looks exactly like "the sheet drew nothing". */
+    document.title = 'sheet:' + SHEET + ' ERROR ' + err.message + ' @ ' +
+        (err.stack || '').split('\n')[1];
+}
+</script>
+</body>
+</html>

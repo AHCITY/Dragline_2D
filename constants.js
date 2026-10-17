@@ -49,6 +49,21 @@ const SHIFT_PERFECT_LOW  = 0.88;
 const SHIFT_PERFECT_HIGH = 0.98;
 const SHIFT_GOOD_LOW     = 0.75;
 
+/* ─── Launch (N → 1st clutch dump at the line) ───
+   The launch is NOT judged by the shift windows. The only input that
+   matters is the rev the engine carried at the moment 1st went in: the
+   higher the staged rpm, the harder the engine pulls AND the better the
+   tires hook up (weight transfer) — exactly like a real drag-strip
+   launch. See Car.judgeLaunch() in car.js. */
+const LAUNCH_PERFECT_RATIO = 0.90; // rpm/redline that scores a 100% launch
+const LAUNCH_FORCE_BONUS   = 0.35; // max +35% wheel force during the window
+const LAUNCH_GRIP_BONUS    = 0.30; // max +30% traction during the window
+const LAUNCH_TIME          = 1.5;  // seconds the launch window stays open
+const LAUNCH_ENGAGE_MIN    = 0.02; // fastest engagement cut (s, high-rpm dump)
+const LAUNCH_ENGAGE_MAX    = 0.15; // slowest engagement cut (s, low-rpm dump)
+const LAUNCH_SPIN_KEPT     = 0.75; // traction kept while spinning at 0 quality
+                                   // (rises to 1.0 — tires "hook" — at 100%)
+
 /* ─── Shift Bonuses (perfect = small, honest advantage) ─── */
 const BONUS_PERFECT = 0.10;   // +10% wheel force for a short window
 const BONUS_GOOD    = 0.03;
@@ -90,6 +105,35 @@ const MP_SYNC_MS            = 300;  // how often an authoritative position snaps
 const MP_OUTCOME_TIMEOUT_MS = 1500; // how long to wait for the peer's race-result report before falling back to local data
 const MP_STAGING_FALLBACK_MS = 20000; // host auto-starts the countdown if the opponent never revs at the line
 const MP_DISCONNECT_GRACE_MS = 2500;  // WebRTC 'disconnected' can be transient — wait before declaring the peer lost
+/* How far from the green light a rev timestamp may sit and still be believed
+   as a launch decision. The host converts the guest's stamp into its own
+   timeline using a clock offset measured from ping/pong; if that calibration
+   is stale, or the stamp is simply crafted, the resulting value can land
+   anywhere. Convicting a player on a stamp that far from the light would be
+   worse than missing a genuine jump, so anything beyond this window is
+   treated as "no evidence" rather than as a false start. */
+const MP_REV_PLAUSIBLE_MS  = 6000;
+/* Ceiling the host is willing to believe a peer's car could have travelled,
+   matching the speed clamp already used for the replica in _applySync. Any
+   lower bound on a peer's finish time is derived from this, so it must sit
+   ABOVE the fastest car in the game or an honest racer could be slowed down. */
+const MP_PEER_MAX_SPEED    = 140;
+/* The peer's finish time is cross-checked against the furthest position the
+   host has already ACCEPTED on the sync channel, plus however long the
+   remaining distance could plausibly take. Only the shortfall is corrected —
+   a peer is never handed a time FASTER than it proved, and never a slower
+   one than it earned. */
+const MP_FINISH_SLACK_MS   = 250;
+/* ping/pong clock calibration is measured once at connect. Networks drift
+   (Wi-Fi handoff, thermal throttling, a phone sleeping) over a long heat, and
+   a stale offset silently moves the peer's rev stamp across the green light.
+   Re-measure on this interval during a live race. */
+const MP_CLOCK_RESYNC_MS   = 10000;
+/* Only a correction SMALLER than this is applied live. A large jump means the
+   calibration itself is suspect (a stalled tab, a suspended device), and
+   yanking the timeline mid-race would be worse than the drift it fixes — the
+   same fail-open rule MP_REV_PLAUSIBLE_MS already applies to rev stamps. */
+const MP_CLOCK_MAX_FIX_MS  = 400;
 
 /* ─── Multiplayer Tournament (best-of-3 series) ─── */
 const MP_TOURNEY_HEAT_WIN     = 150; // per-heat payout for winning a tournament heat

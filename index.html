@@ -6,8 +6,41 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="theme-color" content="#050505">
-    <title>Pixel Drag Racer - Evo 3.9</title>
+    <title>Redline 2D - Evo 2.4</title>
+    <!-- Build stamp: the boot log prints this, so a stale cached page
+         is identifiable at a glance (see console on load). -->
+    <meta name="rl-build" content="2026-10-10.1 · Evo 2.4 + V10 invites/shop + SCALE-1 garage">
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="auth.css">
+    <script>
+    /* Auth boot-lock (runs before first paint): if this device holds NO
+       persisted sign-in — neither our own rla_uid marker (auth.js) nor the
+       Firebase SDK session record — the game stage is hidden from the very
+       first frame and the driver sign-in page renders as its OWN page, not
+       an overlay above the main menu. This kills the old "menu flashes for
+       1–3 s after logout+refresh" gap, which was the time Firebase needed
+       to answer onAuthStateChanged. auth.js removes the lock the instant a
+       real session resolves (or the offline watchdog stands the game down).
+       Pure feature detection — no game data, no PII, no injection surface. */
+    (function () {
+        try {
+            var has = !!localStorage.getItem('rla_uid');
+            if (!has) {
+                for (var i = 0; i < localStorage.length; i++) {
+                    var k = localStorage.key(i);
+                    if (k && k.lastIndexOf('firebase:authUser', 0) === 0 && k.slice(-9) === '[DEFAULT]') { has = true; break; }
+                }
+            }
+            if (!has) document.documentElement.className += ' rla-bootlock';
+        } catch (e) { /* storage blocked: gate still works, worst case one paint */ }
+        // Reduced-FX preference also applies BEFORE first paint so the very
+        // first frame already respects the driver's motion setting (no
+        // animation flash on reload).
+        try {
+            if (localStorage.getItem('rla_fx') === '1') document.documentElement.classList.add('reduce-motion');
+        } catch (e) {}
+    })();
+    </script>
 </head>
 <body>
 
@@ -53,10 +86,13 @@
     </div>
 
     <div id="main-menu" class="menu-overlay">
-        <h1>PIXEL<br>DRAG LEGENDS</h1>
+        <h1>REDLINE<br>2D</h1>
         <div id="menu-profile" class="pf-chip" role="button" tabindex="0" onclick="Profile.openPanel()" aria-label="Open driver profile">
             <span class="mp-avatar pf-chip-avatar"></span>
             <span id="menu-profile-name" class="pf-chip-name">DRIVER</span>
+            <!-- Driver level chip — filled by game.updateMenuUI() from
+                 Career.levelInfo(); hidden until the career layer is ready. -->
+            <span id="driver-level-chip" class="pf-chip-level" hidden aria-label="Driver level">LVL 1</span>
         </div>
         <div id="menu-cash-box" style="color:#4caf50; font-size: 14px; position:absolute; top: max(15px, env(safe-area-inset-top)); right: max(20px, env(safe-area-inset-right)); background:#000; padding:5px 10px; border:1px solid #333;">CASH: $<span id="menu-cash">0</span></div>
         <div class="menu-grid">
@@ -70,7 +106,20 @@
             <div class="menu-btn" onclick="game.toggleFullscreenFromMenu()" style="background:#455a64; border-color:#78909c; grid-column: 1 / -1;">FULLSCREEN</div>
         </div>
         <div id="menu-record" class="menu-record" role="status" aria-label="Personal best elapsed time"></div>
+        <!-- Daily login bonus: claims once per local day, streak pips show
+             the return run. Positioned under the CASH box (mirrors the
+             left chip stack); all text filled by daily.js via textContent. -->
+        <div id="daily-bonus" class="daily-bonus" hidden>
+            <span id="daily-streak" class="daily-streak">DAILY BONUS</span>
+            <span id="daily-pips" class="daily-pips" aria-hidden="true"></span>
+            <b id="daily-amount" class="daily-amount">+$250</b>
+            <button type="button" id="daily-claim" class="daily-claim">CLAIM</button>
+        </div>
         <div id="menu-settings-btn" class="menu-settings-btn" role="button" tabindex="0" aria-label="Open settings" onclick="game.openSettings()">&#9881; SETTINGS</div>
+        <!-- Career ledger — compact corner control (the menu grid's vertical
+             rhythm is tuned for exactly 8 buttons; see style.css comments).
+             The count chip fills in from career.js via updateMenuUI(). -->
+        <div id="career-menu-btn" class="career-menu-btn" role="button" tabindex="0" aria-label="Open career ledger and achievements" onclick="Career.openPanel()"><span class="career-btn-trophy" aria-hidden="true">&#9733;</span> CAREER<span id="career-btn-count" class="career-btn-count"></span></div>
     </div>
 
     <div id="pause-menu" class="menu-overlay hidden">
@@ -103,6 +152,7 @@
         <div class="menu-grid settings-grid">
             <div class="menu-btn green" id="set-sound-btn" role="button" tabindex="0" onclick="game.toggleSound()">SOUND: ON</div>
             <div class="menu-btn" id="set-music-btn" role="button" tabindex="0" onclick="game.toggleMusic()">MUSIC: ON</div>
+            <div class="menu-btn" id="set-fx-btn" role="button" tabindex="0" onclick="game.toggleReduceFx()" aria-label="Toggle reduced motion effects">REDUCE FX: OFF</div>
         </div>
         <div class="pause-vols">
             <div class="pause-vol-row">
@@ -119,7 +169,27 @@
 
     <div id="garage-menu" class="menu-overlay hidden">
         <h2>MY GARAGE</h2>
-        <div id="car-stats-display" class="scroll-container garage-list"></div>
+        <!-- Top car-list REMOVED: the stage below IS the selector. The two
+             arrows walk the owned cars (wrap-around); the customization
+             panel stays mounted and re-syncs in place on every swap. -->
+        <div id="gar-stage" class="gar-stage">
+            <div id="gar-stage-frame" class="gar-stage-frame">
+                <div class="gar-canvas-box">
+                    <canvas id="garage-preview" width="680" height="240" aria-label="Preview of your customized car"></canvas>
+                    <div id="gar-prev" class="gar-nav-btn" role="button" tabindex="0" aria-label="Previous owned car" onclick="game.garageNavigate(-1)">&#9664;</div>
+                    <div id="gar-next" class="gar-nav-btn" role="button" tabindex="0" aria-label="Next owned car" onclick="game.garageNavigate(1)">&#9654;</div>
+                    <div id="gar-empty" class="gar-empty hidden">GARAGE EMPTY<br>BUY A CAR IN THE SHOWROOM</div>
+                </div>
+                <div class="gar-stage-info">
+                    <span id="gar-stage-name" class="gar-stage-name">&mdash;</span>
+                    <span id="gar-stage-stats" class="gar-stage-stats">&mdash;</span>
+                    <span class="gar-stage-meta">
+                        <span id="gar-stage-idx" class="gar-stage-idx">1/1</span>
+                        <span class="gar-stage-driving">DRIVING</span>
+                    </span>
+                </div>
+            </div>
+        </div>
         <div id="garage-custom" class="gar-custom hidden"></div>
         <div class="menu-btn" style="margin-top: 10px; width: 200px;" onclick="game.returnToMenu()">BACK</div>
     </div>
@@ -225,7 +295,6 @@
             <div class="pf-top">
                 <span id="profile-avatar" class="mp-avatar pf-avatar" role="button" tabindex="0" onclick="Profile.pickAvatar()" aria-label="Change avatar (upload an image)"></span>
                 <div class="pf-id-block">
-                    <div id="profile-stats" class="pf-stats">&nbsp;</div>
                     <div class="pf-id-row">
                         <span class="pf-id-label">PROFILE ID</span>
                         <span id="profile-id-copy" class="pf-copy-icon" role="button" tabindex="0" onclick="Profile.copyId()" aria-label="Copy Profile ID to clipboard">
@@ -290,13 +359,68 @@
                 <span class="results-label">Prize:</span>
                 <span id="result-prize" class="results-value results-value-prize">$0</span>
             </div>
+            <!-- XP earned this race — filled from the value Career actually
+                 banked (recordRace/recordMp return it). Hidden on modes that
+                 award nothing, so the row never prints a guessed number. -->
+            <div id="result-xp-row" class="results-row results-row-xp hidden">
+                <span class="results-label">XP:</span>
+                <span id="result-xp" class="results-value results-value-xp">+0</span>
+            </div>
         </div>
+        <!-- Ghost-run verdict chip — GHOST RUN (neutral) or NEW GHOST RECORD
+             (gold) when the replay lost. Hidden in every other mode. -->
+        <div id="result-ghost-badge" class="results-ghost-badge hidden" aria-live="polite"></div>
         <div id="result-rematch-btn" class="menu-btn mp-rematch-btn hidden" onclick="game.rematch()">REMATCH</div>
         <div id="result-ghost-again-btn" class="menu-btn ghost-btn results-ghost-again hidden" onclick="game.raceGhostAgain()">RACE GHOST AGAIN</div>
         <div class="menu-btn results-continue" onclick="game.returnToMenu()">CONTINUE</div>
     </div>
 
+    <!-- Career ledger: lifetime stats + the achievement board (career.js).
+         Panel language mirrors the profile panel; BACK reuses the standard
+         menu transition. Everything is rendered with numbers/dev-owned
+         strings through the same innerHTML pattern the shop uses. -->
+    <div id="career-menu" class="menu-overlay hidden">
+        <h2 style="color:#ffd54f">CAREER</h2>
+        <div class="career-panel">
+            <!-- Driver level bar — gold XP progress opener (career.js). -->
+            <div id="career-xp" class="career-xp"></div>
+            <div id="career-stats" class="career-stats"></div>
+            <!-- TODAY strip — local-day snapshot (races/wins/best), hidden on
+                 days with no races. All content is dev-owned strings/numbers. -->
+            <div id="career-today" class="career-today" hidden></div>
+            <!-- ET progression — dependency-free canvas sparkline of the last
+                 20 timed runs; hidden until there are two to compare. -->
+            <div id="career-spark-wrap" class="career-spark-wrap" hidden>
+                <div class="career-spark-head">
+                    <span class="career-section-label">ET PROGRESSION</span>
+                    <span class="career-spark-note">LAST 20 TIMED RUNS &middot; DOTTED RAIL = PB</span>
+                </div>
+                <canvas id="career-spark" class="career-spark" aria-hidden="true"></canvas>
+            </div>
+            <div class="career-ach-head-row">
+                <span class="career-section-label">RACE LEDGER</span>
+                <span id="career-hist-count" class="career-ach-count">&mdash;</span>
+            </div>
+            <!-- Filter chips (ALL/WINS/LOSSES/PB) + last-5 form dots — filled
+                 by Career._renderLedgerTop(); the scrollable rows live below. -->
+            <div id="career-ledger-top" class="career-ledger-top"></div>
+            <div id="career-history" class="career-history" role="list" aria-label="Race history"></div>
+            <div class="career-ach-head-row">
+                <span class="career-section-label">ACHIEVEMENTS</span>
+                <span id="career-ach-count" class="career-ach-count">&mdash;</span>
+            </div>
+            <div id="career-achievements" class="career-ach-list" role="list" aria-label="Achievements"></div>
+        </div>
+        <div class="menu-btn red mp-back" role="button" tabindex="0" onclick="game.returnToMenu()">BACK</div>
+    </div>
+
+<!-- V10H1-INVITE-STACK -->
     <div id="notification">PERFECT SHIFT</div>
+
+    <!-- Incoming race invitations (friends invite flow). Fixed to the
+         right edge, slightly above vertical center; cards are built and
+         torn down by friends.js, one per sender, self-expiring. -->
+    <div id="race-invite-stack" role="region" aria-live="polite" aria-label="Incoming race invitations"></div>
     <div id="save-indicator">SAVED</div>
 </div>
 
@@ -310,6 +434,16 @@
 <!-- Modular Scripts -->
 <script src="constants.js"></script>
 <script src="save-system.js"></script>
+<!-- Career ledger + achievements: local-first counters under their own save
+     key. Must load before game.js (the race-finish hooks call it) and after
+     save-system.js (init() reads through the same pipeline). -->
+<script src="career.js"></script>
+<!-- Daily login bonus: local-first retention loop under its own save key
+     (namespaced per account by save-system.js). Loads after career.js /
+     before game.js — game.init() awaits DailyBonus.init() and the menu
+     renderer refreshes the strip. -->
+<script src="daily.js"></script>
+<script src="moderator.js"></script>
 <script src="particles.js"></script>
 <script src="sfx.js"></script>
 <script src="car-art.js"></script>
@@ -317,25 +451,47 @@
 <script src="renderer.js"></script>
 <script src="profile.js"></script>
 <script src="friends.js"></script>
+<script src="wallet.js"></script>
 <script src="game.js"></script>
-
-<!-- ===================================================================
-     DEV TOOLS — DELIBERATELY NOT LOADED HERE.
-     This is the file you ship. It must not contain the cheats in ANY
-     form: a browser game gives its source to every player, so nothing
-     referenced here can be kept secret by being hidden. Absence is the
-     only real protection.
-     To get the cheat panel, open index.dev.html (generated by
-     tools/make_dev_page.mjs) or uncomment the line below locally.
-     Before shipping: confirm this file still has no active devtools
-     reference, and do NOT deploy devtools.js or index.dev.html.
-     ===================================================================
-<script src="devtools.js"></script>
--->
 
 <!-- Multiplayer: Firebase is used ONLY to exchange the WebRTC handshake (see multiplayer.js) -->
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-database-compat.js"></script>
+<!-- Auth: same Firebase project, compat auth SDK + the gate/account layer.
+     auth.js builds the launch gate (Google / Email / Guest + reset flows)
+     and plugs into the ProfileAuth seam in profile.js. It must load AFTER
+     multiplayer.js (shares FIREBASE_CONFIG + the initialized app). -->
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
 <script src="multiplayer.js"></script>
+<script src="auth.js"></script>
+
+<!-- ===================================================================
+     DEV-TOOLS AUTO-LOADER — development only, self-discovering.
+     If game-dev-bridge.dev.js / cheat-menu.dev.js / cheat-menu.dev.css sit
+     next to this page, the developer cheat menu loads automatically
+     (toggle: ` backquote hotkey, or the green DEV TOOLS tab).
+     Publishing the game? Delete the *.dev.* files — every miss below is
+     caught and skipped silently; the game never depends on them.
+     =================================================================== -->
+<link rel="stylesheet" href="cheat-menu.dev.css" onerror="this.remove()">
+<script>
+// Chain: bridge first; the menu loads only if the bridge actually arrived.
+// Missing files (published game) = silent skip. See cheat-menu.dev.md.
+(function () {
+    'use strict';
+    function load(src, ok) {
+        var s = document.createElement('script');
+        s.src = src;
+        s.onload = ok;
+        s.onerror = function () { /* dev file absent — production path, ignore */ };
+        document.head.appendChild(s);
+    }
+    load('game-dev-bridge.dev.js', function () {
+        load('cheat-menu.dev.js', function () {
+            console.info('%c[RLD-DEV] cheat menu ready — press ` (backquote) to toggle', 'color:#4caf50');
+        });
+    });
+})();
+</script>
 </body>
 </html>

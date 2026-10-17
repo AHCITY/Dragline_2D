@@ -1,0 +1,337 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "$other": {
+      ".validate": false
+    },
+    "pdl_idClaim": {
+      "$pid": {
+        ".write": "auth != null && newData.exists() === true && $pid.matches(/^[0-9a-f]{16}$/) && (!data.exists() || data.val() === auth.uid)",
+        ".validate": "newData.isString() && newData.val() === auth.uid"
+      }
+    },
+    "pdl_mp_rooms": {
+      "$code": {
+        ".read": "auth != null && $code.matches(/^[A-Z0-9]{5}$/)",
+        ".write": "auth != null && $code.matches(/^[A-Z0-9]{5}$/) && ((newData.exists() === false && (data.child('host').val() === auth.uid || data.child('host').exists() === false)) || (newData.exists() === true && newData.child('host').isString() === true && newData.child('host').val() === auth.uid && (data.exists() === false || data.child('host').exists() === false || data.child('host').val() === auth.uid || (data.child('ts').exists() === true && now - data.child('ts').val() > 300000))))",
+        "host": {
+          ".validate": "newData.isString() && newData.val() === auth.uid && newData.val().length >= 10 && newData.val().length <= 128"
+        },
+        "guest": {
+          ".write": "auth != null && newData.exists() === true && newData.isString() === true && newData.val() === auth.uid && data.parent().hasChild('host') && (!data.exists() || data.val() === auth.uid || (data.parent().child('ts').exists() === true && now - data.parent().child('ts').val() > 300000))",
+          ".validate": "newData.isString() && newData.val() === auth.uid && newData.val().length >= 10 && newData.val().length <= 128"
+        },
+        "ts": {
+          ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+        },
+        "offer": {
+          ".validate": "newData.hasChildren(['sdp', 'type'])",
+          "sdp": {
+            ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 20480"
+          },
+          "type": {
+            ".validate": "newData.isString() && (newData.val() === 'offer' || newData.val() === 'answer' || newData.val() === 'pranswer' || newData.val() === 'rollback')"
+          },
+          "challenge": {
+            ".validate": "newData.val() === null || (newData.isString() && newData.val().length >= 1 && newData.val().length <= 128)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "answer": {
+          ".write": "auth != null && data.parent().child('guest').val() === auth.uid && ((!data.exists() && data.parent().hasChild('offer')) || (data.parent().child('ts').exists() === true && now - data.parent().child('ts').val() > 300000))",
+          ".validate": "newData.hasChildren(['sdp', 'type'])",
+          "sdp": {
+            ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 20480"
+          },
+          "type": {
+            ".validate": "newData.isString() && (newData.val() === 'offer' || newData.val() === 'answer' || newData.val() === 'pranswer' || newData.val() === 'rollback')"
+          },
+          "proof": {
+            ".validate": "newData.val() === null || (newData.isString() && newData.val().length >= 1 && newData.val().length <= 128)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "hostCandidates": {
+          "$cid": {
+            ".validate": "newData.hasChildren(['candidate'])",
+            "candidate": {
+              ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 300"
+            },
+            "sdpMid": {
+              ".validate": "newData.val() === null || (newData.isString() && newData.val().length <= 5)"
+            },
+            "sdpMLineIndex": {
+              ".validate": "newData.val() === null || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 9)"
+            },
+            "usernameFragment": {
+              ".validate": "newData.val() === null || (newData.isString() && newData.val().length <= 64)"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "guestCandidates": {
+          "$cid": {
+            ".write": "auth != null && data.parent().parent().child('guest').val() === auth.uid",
+            ".validate": "newData.hasChildren(['candidate'])",
+            "candidate": {
+              ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 300"
+            },
+            "sdpMid": {
+              ".validate": "newData.val() === null || (newData.isString() && newData.val().length <= 5)"
+            },
+            "sdpMLineIndex": {
+              ".validate": "newData.val() === null || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 9)"
+            },
+            "usernameFragment": {
+              ".validate": "newData.val() === null || (newData.isString() && newData.val().length <= 64)"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+    "pdl_profiles": {
+      "$pid": {
+        ".read": "auth != null && $pid.matches(/^[0-9a-f]{16}$/)",
+        ".write": "auth != null && $pid.matches(/^[0-9a-f]{16}$/) && newData.exists() && root.child('pdl_idClaim').child($pid).val() === auth.uid",
+        ".validate": "newData.hasChildren(['name', 'stats', 'updatedAt'])",
+        "name": {
+          ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9 _.-]{2,14}$/)"
+        },
+        "av": {
+          ".validate": "newData.val() === null || (newData.isString() && newData.val().length <= 40000 && (newData.val().beginsWith('data:image/webp') || newData.val().beginsWith('data:image/jpeg')))"
+        },
+        "stats": {
+          ".validate": "newData.hasChildren(['races', 'wins', 'losses'])",
+          "races": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1000000"
+          },
+          "wins": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1000000"
+          },
+          "losses": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1000000"
+          },
+          "bestET": {
+            ".validate": "newData.val() === null || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 600)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "provider": {
+          ".validate": "newData.isString() && newData.val().matches(/^(local|google|playgames|email|guest)$/)"
+        },
+        "updatedAt": {
+          ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+        },
+        "$other": {
+          ".validate": false
+        },
+        "mod": {
+          ".validate": "newData.val() === null || (newData.hasChildren(['v', 't', 'src']) && newData.child('v').isString() && newData.child('v').val() === 'dam1' && newData.child('t').isNumber() && newData.child('t').val() <= now + 60000 && newData.child('src').isString() && (newData.child('src').val() === 'server' || newData.child('src').val() === 'device') && (newData.child('s').val() === null || newData.child('s').isNumber()))",
+          "v": {
+            ".validate": "newData.isString() && newData.val() === 'dam1'"
+          },
+          "s": {
+            ".validate": "newData.val() === null || (newData.isNumber() && newData.val() >= 0 && newData.val() <= 1)"
+          },
+          "t": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+          },
+          "src": {
+            ".validate": "newData.isString() && (newData.val() === 'server' || newData.val() === 'device')"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    },
+    "pdl_friendRequests": {
+      "$to": {
+        ".read": "auth != null && $to.matches(/^[0-9a-f]{16}$/)",
+        "$from": {
+          ".write": "auth != null && $from.matches(/^[0-9a-f]{16}$/) && $to.matches(/^[0-9a-f]{16}$/) && (newData.exists() === false ? (root.child('pdl_idClaim').child($from).val() === auth.uid || root.child('pdl_idClaim').child($to).val() === auth.uid) : root.child('pdl_idClaim').child($from).val() === auth.uid)",
+          ".validate": "newData.hasChildren(['from', 'fromName', 'ts'])",
+          "from": {
+            ".validate": "newData.isString() && newData.val() === $from"
+          },
+          "fromName": {
+            ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 20"
+          },
+          "ts": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    },
+    "pdl_requestOutcomes": {
+      "$sender": {
+        ".read": "auth != null && $sender.matches(/^[0-9a-f]{16}$/)",
+        "$decliner": {
+          ".write": "auth != null && $sender.matches(/^[0-9a-f]{16}$/) && $decliner.matches(/^[0-9a-f]{16}$/) && (newData.exists() === false ? root.child('pdl_idClaim').child($sender).val() === auth.uid : (root.child('pdl_idClaim').child($decliner).val() === auth.uid && root.child('pdl_friendRequests').child($decliner).child($sender).exists()))",
+          ".validate": "newData.hasChildren(['status', 'at'])",
+          "status": {
+            ".validate": "newData.isString() && newData.val() === 'declined'"
+          },
+          "at": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    },
+    "pdl_friends": {
+      "$uid": {
+        ".read": "auth != null && $uid.matches(/^[0-9a-f]{16}$/)",
+        "$friend": {
+          ".write": "auth != null && $uid.matches(/^[0-9a-f]{16}$/) && $friend.matches(/^[0-9a-f]{16}$/) && (newData.exists() === false ? (root.child('pdl_idClaim').child($uid).val() === auth.uid || root.child('pdl_idClaim').child($friend).val() === auth.uid) : ((root.child('pdl_idClaim').child($uid).val() === auth.uid && root.child('pdl_friendRequests').child($uid).child($friend).exists()) || (root.child('pdl_idClaim').child($friend).val() === auth.uid && root.child('pdl_friendRequests').child($friend).child($uid).exists())))",
+          ".validate": "newData.hasChildren(['name', 'ts'])",
+          "name": {
+            ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 20"
+          },
+          "ts": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    },
+    "pdl_presence": {
+      "$uid": {
+        ".read": "auth != null && $uid.matches(/^[0-9a-f]{16}$/)",
+        ".write": "auth != null && $uid.matches(/^[0-9a-f]{16}$/) && newData.exists() && root.child('pdl_idClaim').child($uid).val() === auth.uid",
+        ".validate": "newData.hasChildren(['online', 'lastSeen'])",
+        "online": {
+          ".validate": "newData.isBoolean()"
+        },
+        "name": {
+          ".validate": "newData.val() === null || (newData.isString() && newData.val().length >= 1 && newData.val().length <= 20)"
+        },
+        "lastSeen": {
+          ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+    "pdl_invites": {
+      "$to": {
+        ".read": "auth != null && $to.matches(/^[0-9a-f]{16}$/)",
+        "$from": {
+          ".write": "auth != null && $from.matches(/^[0-9a-f]{16}$/) && $to.matches(/^[0-9a-f]{16}$/) && (newData.exists() === false ? (root.child('pdl_idClaim').child($from).val() === auth.uid || root.child('pdl_idClaim').child($to).val() === auth.uid) : root.child('pdl_idClaim').child($from).val() === auth.uid)",
+          ".validate": "newData.hasChildren(['from', 'fromName', 'code', 'ts'])",
+          "from": {
+            ".validate": "newData.isString() && newData.val() === $from"
+          },
+          "fromName": {
+            ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 20"
+          },
+          "code": {
+            ".validate": "newData.isString() && newData.val().matches(/^[A-Z0-9]{5}$/)"
+          },
+          "ts": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    },
+    "pdl_wallet": {
+      "$pid": {
+        ".read": "auth != null && $pid.matches(/^[0-9a-f]{16}$/) && root.child('pdl_idClaim').child($pid).val() === auth.uid",
+        ".write": "auth != null && $pid.matches(/^[0-9a-f]{16}$/) && root.child('pdl_idClaim').child($pid).val() === auth.uid && newData.exists() === true && (\n  (!data.exists() &&\n    newData.child('head').val() === 1 &&\n    newData.child('balance').val() === 2500 &&\n    newData.child('move').child('seq').val() === 1 &&\n    newData.child('move').child('d').val() === 2500 &&\n    newData.child('move').child('r').val() === 'boot-grant' &&\n    newData.child('move').child('b').val() === 2500 &&\n    newData.child('ewSum').val() === 0)\n  ||\n  (data.exists() &&\n    newData.child('head').isNumber() &&\n    newData.child('head').val() === data.child('head').val() + 1 &&\n    newData.child('head').val() <= 200000 &&\n    newData.child('balance').isNumber() &&\n    newData.child('balance').val() === data.child('balance').val() + newData.child('move').child('d').val() &&\n    newData.child('balance').val() >= 0 &&\n    newData.child('balance').val() <= 999999999 &&\n    newData.child('move').hasChildren(['seq', 'd', 'r', 'ts', 'b']) &&\n    newData.child('move').child('seq').val() === newData.child('head').val() &&\n    newData.child('move').child('d').isNumber() &&\n    newData.child('move').child('d').val() !== 0 &&\n    newData.child('move').child('d').val() >= -500000 &&\n    newData.child('move').child('d').val() <= 50000 &&\n    newData.child('move').child('r').isString() && newData.child('move').child('r').val().matches(/^[A-Za-z0-9:_-]{1,24}$/) &&\n    newData.child('move').child('ts').isNumber() &&\n    newData.child('move').child('ts').val() <= now + 60000 &&\n    newData.child('move').child('b').val() === newData.child('balance').val() &&\n    (newData.child('move').child('d').val() < 0 ? (newData.child('move').child('r').val().beginsWith('buy:') || newData.child('move').child('r').val().beginsWith('upgrade:') || newData.child('move').child('r').val() === 'offline-sync') : !newData.child('move').child('r').val().beginsWith('buy:')) &&\n    (newData.child('move').child('d').val() > 0 ? (\n        (now - data.child('ewStart').val() > 600000 &&\n          newData.child('ewStart').val() === newData.child('move').child('ts').val() &&\n          newData.child('ewStart').val() > data.child('ewStart').val() &&\n          newData.child('ewSum').val() === newData.child('move').child('d').val())\n        ||\n        (now - data.child('ewStart').val() <= 600000 &&\n          newData.child('ewStart').val() === data.child('ewStart').val() &&\n          newData.child('ewSum').val() === data.child('ewSum').val() + newData.child('move').child('d').val() &&\n          newData.child('ewSum').val() <= 60000)\n      ) : (\n        newData.child('ewStart').val() === data.child('ewStart').val() &&\n        newData.child('ewSum').val() === data.child('ewSum').val()\n      ))\n  )\n)",
+        "balance": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 999999999"
+        },
+        "head": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200000"
+        },
+        "move": {
+          ".validate": "newData.hasChildren(['seq', 'd', 'r', 'ts', 'b'])",
+          "seq": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200000"
+          },
+          "d": {
+            ".validate": "newData.isNumber() && newData.val() !== 0 && newData.val() >= -500000 && newData.val() <= 50000"
+          },
+          "r": {
+            ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9:_-]{1,24}$/)"
+          },
+          "ts": {
+            ".validate": "newData.isNumber() && newData.val() <= now + 60000 && newData.val() > now - 31536000000"
+          },
+          "b": {
+            ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 999999999"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "ewStart": {
+          ".validate": "newData.isNumber() && newData.val() <= now + 60000"
+        },
+        "ewSum": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 60000"
+        },
+        "journal": {
+          "$tid": {
+            ".write": "auth != null && root.child('pdl_idClaim').child($pid).val() === auth.uid && (\n  (newData.exists() === true && data.exists() === false &&\n    newData.parent().parent().child('head').val() === newData.child('seq').val() &&\n    newData.parent().parent().child('move').child('d').val() === newData.child('d').val() &&\n    newData.parent().parent().child('move').child('r').val() === newData.child('r').val() &&\n    newData.parent().parent().child('balance').val() === newData.child('b').val())\n  ||\n  (newData.exists() === false && data.child('seq').isNumber() &&\n    data.parent().parent().child('head').isNumber() &&\n    data.child('seq').val() <= data.parent().parent().child('head').val() - 60)\n)",
+            ".validate": "newData.hasChildren(['seq', 'd', 'r', 'ts', 'b'])",
+            "seq": {
+              ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200000"
+            },
+            "d": {
+              ".validate": "newData.isNumber() && newData.val() !== 0 && newData.val() >= -500000 && newData.val() <= 50000"
+            },
+            "r": {
+              ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9:_-]{1,24}$/)"
+            },
+            "ts": {
+              ".validate": "newData.isNumber() && newData.val() <= now + 60000 && newData.val() > now - 31536000000"
+            },
+            "b": {
+              ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 999999999"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+    "pdl_uidIndex": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid && $uid.length >= 10 && $uid.length <= 128",
+        ".write": "auth != null && auth.uid === $uid && $uid.length >= 10 && $uid.length <= 128",
+        ".validate": "newData.isString() && newData.val().matches(/^[0-9a-f]{16}$/)"
+      }
+    }
+  }
+}

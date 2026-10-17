@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * ─── Pixel Drag Legends — P2P Multiplayer ───────────────────────────────
+ * ─── Redline 2D — P2P Multiplayer ─────────────────────────────────────
  *
  * Architecture (see chat for the full writeup):
  *  - Each side's OWN car is simulated 100% locally — zero added latency,
@@ -103,11 +103,49 @@ const MP = {
     _expectedProof: null,      // hash(pairId, challenge) the guest's answer must carry
     _myOfferSdp: null,         // our own SDP while hosting a reconnect (yield detection)
     _reconnectListener: null,  // room ref watched while idle in the MP menu
+    _localIceQueue: [],        // ICE candidates gathered while the seat write is still in flight
+    _seatReady: false,         // true once the room's identity write (host/guest) has committed
 
     // ---- race/lobby state ----
     remoteLoadout: null,
     remoteProfile: null,       // peer's driver profile {id, name, av} — shared over P2P
     _remoteOutcome: null,      // peer's race report, may arrive before ours is requested
+
+    // ---- round identity (message scoping) ----
+    // Every race-scoped message carries the round it belongs to. The HOST
+    // mints a fresh id at launch; the guest adopts it. A message stamped for
+    // a different round belongs to a heat that is already over and is
+    // dropped instead of being applied to the live race.
+    //
+    // Note: the 'events' channel is reliable AND ordered (created with no
+    // options, so WebRTC's ordered default applies), which already makes most
+    // cross-heat bleed unreachable. This is defence in depth against a peer
+    // that replays a message or a link that stalls across a whole heat — not
+    // a fix for an observed failure.
+    roundId: null,
+    _roundSeq: 0,
+    // False-start evidence. The player records the instant it first applied
+    // throttle during the countdown on ITS OWN clock; the HOST converts that
+    // into host time and makes the call. A guest never rules on its own.
+    localRevAt: null,          // our rev timestamp, in our own clock
+    remoteRevAt: null,         // guest's rev timestamp, converted to host clock
+    // The host publishes the format for the lobby. A guest may not ready up
+    // until it has actually received that declaration.
+    remoteModeKnown: false,
+    // The instant the light went green, on THIS side's own clock. Each side
+    // derives it from its own real COUNTDOWN→RUNNING transition rather than
+    // re-deriving the light duration, so there is no second copy of the
+    // timing constant that could drift out of step with the race.
+    goAt: null,
+    // The authoritative false-start verdict for the CURRENT round, once the
+    // host has ruled. game.js reads this instead of trusting each client's own
+    // opinion. null = no ruling yet (or not the host yet).
+    localFalseStart: null,
+    // Host-side arbitration scratch for the round in progress.
+    _pendingFinish: null,      // our finish report, while awaiting the peer's
+    _peerFinish: null,         // peer's raceEnd report
+    _hostDecideTimer: 0,
+    _hostVerdictTimer: 0,
 
     // ---- lobby format + tournament series ----
     mpFormat: 'drag',          // 'drag' | 'tournament' — picked in the ready lobby
@@ -136,9 +174,19 @@ const MP = {
     // Replica correction drained in tick(). Declared here (it used to be
     // created lazily on first assignment).
     _syncErr: 0,
+    // When the clock offset was last (re)measured, so a long heat can refresh
+    // a drifting calibration instead of trusting the connect-time sample for
+    // the whole race.
+    _clockCalibratedAt: 0,
     // Monotonic guard against reordered/replayed snapshots on the
     // UNORDERED channel.
     _lastSyncT: 0,
+    // Furthest position the HOST has accepted from the peer's sync stream
+    // this round, and the host-clock instant it was accepted. The peer's
+    // finish time is checked against this: it can never claim to have crossed
+    // the line sooner than its own accepted snapshots make physically
+    // possible.
+    _peerMaxX: 0, _peerMaxXAt: 0,
 
     init() {
         this._wireUI();
@@ -157,6 +205,24 @@ const MP = {
     _fbErrorMessage(e) {
         if (this._isRulesError(e)) return 'FIREBASE RULES BLOCK ACCESS — UPDATE YOUR DATABASE RULES';
         return 'COULD NOT REACH FIREBASE — CHECK CONNECTION';
+    },
+
+    // Signed-in Firebase uid — the identity the database rules bind the
+    // multiplayer room to (host/guest seats). The login gate guarantees a
+    // session; this is the defensive read for the edge cases.
+    _uid() {
+        try { const u = firebase.auth().currentUser; return u ? u.uid : null; } catch (e) { return null; }
+    },
+
+    // Push the ICE candidates queued while our seat write (host/guest claim)
+    // was still in flight. The rules only accept candidates from the seat
+    // owner, so anything gathered early waits here instead of being dropped.
+    _flushLocalIce() {
+        const q = this._localIceQueue;
+        this._localIceQueue = [];
+        if (!this.roomRef || !q.length) return;
+        const list = this.isHost ? 'hostCandidates' : 'guestCandidates';
+        for (const c of q) { try { this.roomRef.child(list).push(c); } catch (e) { /* room gone */ } }
     },
 
     // True when Firebase ANSWERED but the Realtime Database rules denied the
@@ -201,9 +267,17 @@ const MP = {
     // challenge). A stranger who somehow guesses the 5-character room code
     // still can't answer that challenge, all race traffic stays direct
     // DTLS-encrypted P2P, and FORGET wipes the pairing at any time.
+    // The saved pair is namespaced by the signed-in account (SaveSystem
+    // nsKey) — guest and real accounts never see each other's opponents.
+    _pairKey() {
+        const base = (typeof SaveSystem !== 'undefined' && SaveSystem.nsKey)
+            ? SaveSystem.nsKey('mp_peer') : 'mp_peer';
+        return 'pdl_' + base;
+    },
+
     _savedPair() {
         try {
-            const raw = localStorage.getItem('pdl_mp_peer');
+            const raw = localStorage.getItem(this._pairKey());
             if (!raw) return null;
             const p = JSON.parse(raw);
             return (p && p.code && p.pairId) ? p : null;
@@ -211,13 +285,23 @@ const MP = {
     },
 
     _savePair(entry) {
-        try { localStorage.setItem('pdl_mp_peer', JSON.stringify(entry)); } catch (e) {}
+        try { localStorage.setItem(this._pairKey(), JSON.stringify(entry)); } catch (e) {}
         this._refreshQuickPair();
     },
 
     forgetPair() {
-        try { localStorage.removeItem('pdl_mp_peer'); } catch (e) {}
+        try { localStorage.removeItem(this._pairKey()); } catch (e) {}
         this._refreshQuickPair();
+        // FORGET is the user's explicit "start clean with this driver" action,
+        // so it must clear every trace of a pending invite from them too —
+        // otherwise a stale invite row could still land the player in a room
+        // they just asked to be rid of.
+/* V10M2-FORGET-CLEARS-INVITES */
+        if (typeof Friends !== 'undefined' && Friends.clearAllInvites) {
+            // One API for state + timers + visible cards — poking
+            // _pendingInvites directly used to strand both.
+            try { Friends.clearAllInvites(); } catch (e) {}
+        }
         this.status('SAVED OPPONENT FORGOTTEN', '');
         game.showNotification('SAVED OPPONENT FORGOTTEN');
     },
@@ -276,6 +360,8 @@ const MP = {
     async hostReconnect(saved) {
         if (this.pc || this.roomRef) return;
         if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
+        const uid = this._uid();
+        if (!uid) { this.status('MULTIPLAYER NEEDS A SIGN-IN — RELOAD AND LOG IN', 'err'); return; }
         this.isHost = true;
         this.roomCode = saved.code;
         this.status('RECONNECTING TO ' + String(saved.name || 'OPPONENT').toUpperCase() + '...', 'busy');
@@ -288,7 +374,6 @@ const MP = {
             // prefetched pool candidates the pool exists to provide, and the
             // reconnect handshake fell back to a full STUN round-trip.
             this.roomRef = this.db.ref(this.roomPath + '/' + saved.code);
-            this.roomRef.onDisconnect().remove();
 
             this._createPeerConnection();
             this.eventsChannel = this.pc.createDataChannel('events');
@@ -312,10 +397,31 @@ const MP = {
             // was dropped as a proof mismatch, and the reconnect hung
             // forever with no timeout and no error. Nesting it makes offer
             // and challenge a single atomic value that always agree.
+            // If both players clicked the quick button, only one full-room
+            // write survives — watch for a FOREIGN offer BEFORE attempting
+            // our own write, so a lost race yields to the guest seat instead
+            // of stalling on our own value.
+            this.roomRef.child('offer').on('value', snap => {
+                const val = snap.val();
+                if (!val || !val.sdp || !this.pc || this.pc.currentRemoteDescription) return;
+                if (val.sdp !== this._myOfferSdp) this._yieldReconnect(saved);
+            });
+
+            // The write carries host: auth.uid — the database rules bind the
+            // whole room (offer, candidates, deletion) to that identity, so
+            // a stranger who knows the code still can't touch anything.
             await this.roomRef.set({
                 ts: Date.now(),
+                host: uid,
                 offer: { sdp: offer.sdp, type: offer.type, challenge: this.challenge },
             });
+
+            // Crash-cleanup registration happens AFTER the room write: the
+            // rules only let the room's own host remove it, and before the
+            // write the room doesn't exist yet.
+            this.roomRef.onDisconnect().remove();
+            this._seatReady = true;
+            this._flushLocalIce();
 
             this.roomRef.child('guestCandidates').on('child_added', snap => this._addRemoteCandidate(snap.val()));
 
@@ -325,15 +431,6 @@ const MP = {
             if (codeEl) codeEl.innerText = saved.code;
             const who = String(saved.name || 'OPPONENT').toUpperCase();
             this.status('WAITING FOR ' + who + ' TO OPEN MULTIPLAYER', 'busy');
-
-            // If both players clicked the quick button, only one offer
-            // survives the write race — detect the takeover and switch to
-            // the guest seat instead of stalling.
-            this.roomRef.child('offer').on('value', snap => {
-                const val = snap.val();
-                if (!val || !val.sdp || !this.pc || this.pc.currentRemoteDescription) return;
-                if (val.sdp !== this._myOfferSdp) this._yieldReconnect(saved);
-            });
 
             this.roomRef.child('answer').on('value', async snap => {
                 const answer = snap.val();
@@ -352,6 +449,13 @@ const MP = {
             });
         } catch (e) {
             console.warn('Reconnect host failed:', e);
+            if (this._isRulesError(e)) {
+                // Our full-room write lost the race against the pair's other
+                // session (the rules bind the host seat to one auth.uid) —
+                // take the guest seat instead of erroring out.
+                this._yieldReconnect(saved);
+                return;
+            }
             this._handleSetupError(e);
         }
     },
@@ -376,6 +480,7 @@ const MP = {
     async joinReconnect(saved) {
         if (this.pc || this.roomRef) return;
         if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
+        if (!this._uid()) { this.status('MULTIPLAYER NEEDS A SIGN-IN — RELOAD AND LOG IN', 'err'); return; }
         this.isHost = false;
         this.roomCode = saved.code;
         this.status('OPPONENT IS STARTING A RACE — CONNECTING...', 'busy');
@@ -410,6 +515,11 @@ const MP = {
             // Read the challenge from the OFFER, not a sibling key — see the note at
             // the host write. They are written as one atomic value.
             const proof = this._pairProof(saved.pairId, (room.offer && room.offer.challenge) || '');
+            // Claim the guest seat FIRST — the rules only let the claimed
+            // guest write the answer and its ICE candidates.
+            await this.roomRef.child('guest').set(this._uid());
+            this._seatReady = true;
+            this._flushLocalIce();
             await this.roomRef.child('answer').set({ sdp: answer.sdp, type: answer.type, proof });
         } catch (e) {
             console.warn('Reconnect join failed:', e);
@@ -452,27 +562,110 @@ const MP = {
 
     // ─── Lobby race format + best-of-3 tournament series ─────────
     setMode(mode) {
-        if (this.mpFormat === mode) return;
-        this.mpFormat = mode;
+        // Only the host picks the format. This is the LOGIC half of the rule.
+        // Locking the buttons in _refreshModeUI() is only the UI half, and a
+        // locked button stops nobody from calling this function directly.
+        if (!this.isHost) return;
+        const next = (mode === 'tournament') ? 'tournament' : 'drag';
+        if (this.mpFormat === next) return;
+        this.mpFormat = next;
         this.series = null; // switching format abandons any running series
         this._refreshModeUI();
-        this.sendEvent({ type: 'mode', mode });
-        game.showNotification(mode === 'tournament' ? 'TOURNAMENT — FIRST TO 2 HEAT WINS' : 'SINGLE DRAG RACE');
-        // Keep the lobby status line in sync with the picked format.
-        const rp = document.getElementById('mp-ready-panel');
-        if (rp && !rp.classList.contains('hidden')) {
-            this.status(this.mpFormat === 'tournament' ? 'HEAT 1/3 · FIRST TO 2 WINS — READY UP' : 'REMATCH? BOTH HIT READY UP', 'ok');
-        }
+        this.sendEvent({ type: 'mode', mode: next });
+        game.showNotification(next === 'tournament' ? 'TOURNAMENT — FIRST TO 2 HEAT WINS' : 'SINGLE DRAG RACE');
+        this._renderLobby();
     },
 
     _refreshModeUI() {
         const drag = document.getElementById('mp-mode-drag');
         const tour = document.getElementById('mp-mode-tour');
         if (!drag || !tour) return;
-        drag.classList.toggle('mp-mode-on', this.mpFormat !== 'tournament');
-        tour.classList.toggle('mp-mode-on', this.mpFormat === 'tournament');
-        drag.setAttribute('aria-pressed', this.mpFormat !== 'tournament' ? 'true' : 'false');
-        tour.setAttribute('aria-pressed', this.mpFormat === 'tournament' ? 'true' : 'false');
+        const isTour = (this.mpFormat === 'tournament');
+        drag.classList.toggle('mp-mode-on', !isTour);
+        tour.classList.toggle('mp-mode-on', isTour);
+        drag.setAttribute('aria-pressed', !isTour ? 'true' : 'false');
+        tour.setAttribute('aria-pressed', isTour ? 'true' : 'false');
+        // A guest sees the host's choice but may not change it. Marked
+        // disabled rather than hidden so the lobby layout stays stable.
+        const locked = !this.isHost;
+        [drag, tour].forEach(el => {
+            if (!el) return;
+            el.classList.toggle('mp-mode-locked', locked);
+            el.setAttribute('aria-disabled', locked ? 'true' : 'false');
+            el.setAttribute('tabindex', locked ? '-1' : '0');
+        });
+        const hint = document.getElementById('mp-mode-hint');
+        if (hint) hint.textContent = locked ? 'FORMAT SET BY HOST' : '';
+    },
+
+    // ── Lobby rendering ────────────────────────────────────────────────
+    // The ready panel used to be shown by three unrelated events (link-up,
+    // rematch, and an inline poke in setReady) and hidden by a fourth, which
+    // is why it appeared before the format was settled and at no single
+    // predictable place. Visibility is now DERIVED from state and rendered
+    // from exactly one place; no event shows or hides it on its own.
+    _lobbyPhase() {
+        if (!this._connected) return 'offline';
+        if (this._launched) return 'racing';
+        // Never show lobby controls over a live race.
+        if (typeof game !== 'undefined' && game.state === 'RACE') return 'racing';
+        if (this.localReady) return 'readied';
+        // A guest waits for the host to declare the format before it may even
+        // ready up, so the button cannot appear "before mode selection" —
+        // it does not exist yet.
+        if (!this.isHost && !this.remoteModeKnown) return 'awaiting-mode';
+        if (!this.remoteLoadout || !this.remoteProfile) return 'awaiting-peer';
+        // The peer is present and has a car — but it is a car this build does
+        // not stock, so no faithful replica can be built. Refuse to launch and
+        // say so, instead of starting a race against an invented car.
+        if (!this._remoteCarIsStocked()) return 'blocked-car';
+        return 'ready';
+    },
+
+    _renderLobby() {
+        if (typeof game === 'undefined' || typeof document === 'undefined') return;
+        const phase = this._lobbyPhase();
+        // The PANEL is the lobby itself (opponent card, format picker, status
+        // line) and stays up for every lobby-ish phase, including while the
+        // peer's car data is still arriving — otherwise the player would stare
+        // at nothing during "EXCHANGING CAR DATA". The BUTTON is the part whose
+        // timing was unpredictable, and it is derived strictly below.
+        const inLobby = (phase === 'ready' || phase === 'readied'
+            || phase === 'awaiting-mode' || phase === 'awaiting-peer'
+            || phase === 'blocked-car');
+        this._show('mp-choice', false);
+        this._show('mp-host-panel', false);
+        this._show('mp-join-panel', false);
+        this._show('mp-ready-panel', inLobby);
+
+        const btn = document.getElementById('mp-ready-btn');
+        if (btn) {
+            // Once you have readied up the button steps aside and the status
+            // line takes over. Derived here, not toggled by setReady().
+            const show = (phase === 'ready');
+            btn.classList.toggle('hidden', !show);
+            if (show) btn.removeAttribute('aria-hidden'); else btn.setAttribute('aria-hidden', 'true');
+        }
+
+        // The status line follows the same derived phase, so the text and the
+        // button can never describe two different situations.
+        const rp = document.getElementById('mp-ready-panel');
+        if (rp && !rp.classList.contains('hidden')) {
+            if (phase === 'awaiting-peer') {
+                this.status('CONNECTED — EXCHANGING CAR DATA...', 'ok');
+            } else if (phase === 'blocked-car') {
+                this.status('OPPONENT SENT A CAR THIS BUILD DOES NOT STOCK — CANNOT START', 'err');
+            } else if (phase === 'awaiting-mode') {
+                this.status('WAITING FOR HOST TO SET THE FORMAT...', 'ok');
+            } else if (phase === 'readied') {
+                this.status('WAITING FOR OPPONENT TO READY UP...', 'ok');
+            } else if (this.mpFormat === 'tournament') {
+                this.status('HEAT ' + this.seriesHeat() + '/3 · FIRST TO 2 WINS — READY UP', 'ok');
+            } else {
+                this.status('REMATCH? BOTH HIT READY UP', 'ok');
+            }
+        }
+        this._refreshModeUI();
     },
 
     seriesHeat() {
@@ -661,21 +854,39 @@ const MP = {
     },
 
     async hostGame() {
+        // Config is checked BEFORE reserving: _reserveRoomCode() reads this.db,
+        // which only exists once ensureFirebase() has run. Reversing these
+        // would throw on an unconfigured install instead of showing the
+        // friendly "not configured" status line.
+        if (this.pc || this.roomRef) return;
+        if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
+        if (!this._uid()) { this.status('MULTIPLAYER NEEDS A SIGN-IN — RELOAD AND LOG IN', 'err'); return; }
+        const code = await this._reserveRoomCode();
+        await this.hostGameWithCode(code);
+    },
+
+    /* Host a room on a code that is already chosen.
+     *
+     * hostGame() used to reserve its own code inline. Splitting it out lets
+     * the friends INVITE flow reserve a code FIRST, publish it to the
+     * invited player's mailbox, and only then open the room — so by the time
+     * they tap ACCEPT the room genuinely exists. Same handshake either way. */
+    async hostGameWithCode(code) {
         if (this.pc || this.roomRef) return; // already hosting/joining
         if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
+        const uid = this._uid();
+        if (!uid) { this.status('MULTIPLAYER NEEDS A SIGN-IN — RELOAD AND LOG IN', 'err'); return; }
         this._show('mp-choice', false);
         this._show('mp-host-panel', true);
         this.status('CREATING ROOM...', 'busy');
         this.isHost = true;
 
         try {
-            const code = await this._reserveRoomCode();
             this.roomCode = code;
             const codeEl = document.getElementById('mp-room-code');
             if (codeEl) codeEl.innerText = code;
 
             this.roomRef = this.db.ref(this.roomPath + '/' + code);
-            this.roomRef.onDisconnect().remove();
 
             this._createPeerConnection();
             this.eventsChannel = this.pc.createDataChannel('events');
@@ -687,7 +898,14 @@ const MP = {
 
             const offer = await this.pc.createOffer();
             await this.pc.setLocalDescription(offer);
-            await this.roomRef.child('offer').set({ sdp: offer.sdp, type: offer.type });
+            // ONE atomic write claims the room and the HOST seat: the rules
+            // bind offer, candidates and deletion to this auth.uid, so a
+            // stranger who knows the code grants themselves nothing.
+            await this.roomRef.set({ ts: Date.now(), host: uid, offer: { sdp: offer.sdp, type: offer.type } });
+            // Crash-cleanup registration AFTER the write — see hostReconnect.
+            this.roomRef.onDisconnect().remove();
+            this._seatReady = true;
+            this._flushLocalIce();
         } catch (e) {
             console.warn('Host failed:', e);
             this._handleSetupError(e);
@@ -707,14 +925,33 @@ const MP = {
     },
 
     async joinGame() {
-        if (this.pc || this.roomRef) return; // already joining/hosting
-        if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
         const input = document.getElementById('mp-code-input');
         const code = (input ? input.value : '').trim().toUpperCase();
         if (code.length < 4) { this.status('ENTER A VALID CODE', 'err'); return; }
+        await this.joinWithCode(code);
+    },
+
+    /* Programmatic join used by the friends invite flow: a friend accepts an
+       invite and lands in the room without anyone reading a code aloud or
+       typing one in. Identical handshake to joinGame() — kept as its own
+       entry point so the invite path never has to fake keystrokes into the
+       join input box (which would fight the focus/validation above it). */
+    async joinWithCode(code) {
+        if (this.pc || this.roomRef) return; // already joining/hosting
+        if (!this.ensureFirebase()) { this.status('MULTIPLAYER NOT CONFIGURED — SEE multiplayer.js', 'err'); return; }
+        if (!this._uid()) { this.status('MULTIPLAYER NEEDS A SIGN-IN — RELOAD AND LOG IN', 'err'); return; }
+        code = String(code || '').trim().toUpperCase();
+        if (code.length < 4) { this.status('ENTER A VALID CODE', 'err'); return; }
         this.isHost = false;
         this.roomCode = code;
-        this.status('LOOKING FOR ROOM...', 'busy');
+        // Open the same panels the manual path opens, so the player SEES the
+        // connection being made instead of the UI silently freezing wherever
+        // they happened to be when they tapped ACCEPT.
+        this._show('mp-choice', false);
+        this._show('mp-join-panel', true);
+        this._show('mp-host-panel', false);
+        this.status('JOINING ' + code + '...', 'busy');
+        this._armConnectWatchdog();
 
         const ref = this.db.ref(this.roomPath + '/' + code);
         let room = null;
@@ -743,6 +980,11 @@ const MP = {
             this._flushPendingCandidates();
             const answer = await this.pc.createAnswer();
             await this.pc.setLocalDescription(answer);
+            // Claim the guest seat FIRST — the rules only let the claimed
+            // guest write the answer and its ICE candidates.
+            await this.roomRef.child('guest').set(this._uid());
+            this._seatReady = true;
+            this._flushLocalIce();
             await this.roomRef.child('answer').set({ sdp: answer.sdp, type: answer.type });
         } catch (e) {
             console.warn('Join failed:', e);
@@ -759,6 +1001,8 @@ const MP = {
 
     _createPeerConnection() {
         this._peerLostHandled = false;
+        this._seatReady = false;
+        this._localIceQueue = [];
         // iceCandidatePoolSize: pre-allocate/resolve a candidate BEFORE the
         // offer is created, taking STUN off the critical handshake path.
         const cfg = {
@@ -767,9 +1011,15 @@ const MP = {
         };
         this.pc = new RTCPeerConnection(cfg);
         this.pc.onicecandidate = e => {
-            if (!e.candidate || !this.roomRef) return;
+            if (!e.candidate) return;
+            const c = e.candidate.toJSON();
+            // The rules bind ICE pushes to the seat owner, and the seat is
+            // claimed by a DB write that may still be in flight while local
+            // gathering already started. Queue until _seatReady, then flush
+            // in order — no candidate is lost to the claim window.
+            if (!this.roomRef || !this._seatReady) { this._localIceQueue.push(c); return; }
             const list = this.isHost ? 'hostCandidates' : 'guestCandidates';
-            this.roomRef.child(list).push(e.candidate.toJSON());
+            try { this.roomRef.child(list).push(c); } catch (err) { /* room gone */ }
         };
         this.pc.onconnectionstatechange = () => {
             const s = this.pc && this.pc.connectionState;
@@ -806,7 +1056,15 @@ const MP = {
         if (inRace) {
             // Pre-start (staging/countdown): nothing to resolve — clean exit.
             game.showNotification('OPPONENT DISCONNECTED');
-            setTimeout(() => { if (game.state === 'RACE' && !game.finished) game.returnToMenu(); }, 1600);
+            // Same token guard as the lobby branch below. Without it this
+            // timer only asked "is SOME race running", so quitting and
+            // starting a fresh quick race inside 1.6s would satisfy the check
+            // and dump the player back to the menu mid-race.
+            const token = ++this._lobbyResetToken;
+            setTimeout(() => {
+                if (this._lobbyResetToken !== token) return;
+                if (game.state === 'RACE' && !game.finished) game.returnToMenu();
+            }, 1600);
             return;
         }
         // Lobby / ready screen: surface it in the MP status line, then reset.
@@ -881,24 +1139,21 @@ const MP = {
             setTimeout(() => { ref.off(); if (wasHost) ref.remove().catch(() => {}); }, 4000);
         }
 
-        this._show('mp-choice', false);
-        this._show('mp-host-panel', false);
-        this._show('mp-join-panel', false);
-        this._show('mp-ready-panel', true);
-        this.status('CONNECTED! EXCHANGING CAR DATA...', 'ok');
-
-        // BUGFIX: the READY UP button is hidden in setReady() once pressed and
-        // only re-shown in the rematch lobby. A player who raced, left, and
-        // then rejoined the same code used to land in a lobby with NO button.
-        // A fresh connection always starts with the button visible.
-        const readyBtn = document.getElementById('mp-ready-btn');
-        if (readyBtn) {
-            readyBtn.classList.remove('hidden');
-            readyBtn.classList.remove('mp-ready-glow');
-            readyBtn.removeAttribute('aria-hidden');
-        }
+        // A fresh connection shares no state with the previous session. Everything
+        // that could otherwise apply a previous heat's data is cleared here,
+        // in one place, so there is no per-event cleanup to forget.
         this.localReady = false;
         this.remoteReady = false;
+        this._launched = false;
+        this.roundId = null;
+        this.localRevAt = null;
+        this.remoteRevAt = null;
+        this.remoteModeKnown = false;
+        this.remoteLoadout = null;
+        this._remoteOutcome = null;
+        this._outcomeResolve = null;
+        this._verdictResolve = null;
+        this._verdict = null;
 
         // Fresh connection → clear last session's opponent card + profile.
         this.remoteProfile = null;
@@ -916,7 +1171,16 @@ const MP = {
         if (typeof Profile !== 'undefined') this.sendEvent({ type: 'profile', p: Profile.share() });
         this._renderLobbySelf();
 
+        // The host declares the format up front, so the guest never guesses and
+        // can never start a heat under a mode it never saw chosen.
+        if (this.isHost) {
+            this.remoteModeKnown = true;
+            this.sendEvent({ type: 'mode', mode: this.mpFormat });
+        }
+
         this.sendLoadout();
+        // One derived render settles panel, button and status together.
+        this._renderLobby();
         this.calibrateClock();
     },
 
@@ -974,23 +1238,83 @@ const MP = {
     },
 
     setReady() {
+        if (this._launched) return;
+        // Announce a car we can actually defend. The save file is the
+        // authority for what this player owns; if the selected car fails
+        // validation (stale index, hand-edited save, catalog drift) fall back
+        // to a car this player genuinely owns rather than announcing a car we
+        // cannot then load.
+        if (typeof game !== 'undefined' && typeof game.ensureOwnedCar === 'function') {
+            game.ensureOwnedCar();
+        }
         this.localReady = true;
         this.sendLoadout();
         this.sendEvent({ type: 'ready' });
-        const btn = document.getElementById('mp-ready-btn');
-        if (btn) { btn.classList.add('hidden'); btn.setAttribute('aria-hidden', 'true'); }
-        this.status(this.remoteReady ? 'BOTH READY \u2014 STARTING...' : 'WAITING FOR OPPONENT TO READY UP...', 'ok');
+        // Visibility and status are re-derived, never poked directly.
+        this._renderLobby();
         this._maybeLaunch();
     },
 
     _maybeLaunch() {
-        if (this.localReady && this.remoteReady && !this._launched) {
-            this._launched = true;
-            // A completed series restarts clean on the next launch — both
-            // sides derive the reset from identical counts, so no drift.
-            if (this.mpFormat === 'tournament' && this.seriesDecided()) this._resetSeries();
-            game.startRaceMode('multiplayer');
+        if (this._launched) return;
+
+        // A "ready" flag is not proof of a matchable player. Before anyone is
+        // dropped onto the staging line the HOST verifies the things that
+        // actually matter: the peer is still connected, it is the same peer
+        // (its profile and loadout have arrived), it has exchanged a usable
+        // car, and both sides are ready. Starting without these is exactly how
+        // one player ends up alone on the track while the other sits in a
+        // lobby that never launches.
+        if (!this.localReady || !this.remoteReady) return;
+        if (!this._connected) return;
+        if (!this.remoteProfile || !this.remoteProfile.id) return;
+        if (!this.remoteLoadout || !this.remoteLoadout.name) return;
+        // "Has a car" is not the same as "has a car this build stocks". A
+        // loadout naming something we do not have would build an invented
+        // replica on our side, so it blocks the launch instead.
+        if (!this._remoteCarIsStocked()) {
+            console.warn('Refusing to launch: peer announced a car we do not stock —', this.remoteLoadout && this.remoteLoadout.name);
+            return;
         }
+        // The format is the HOST's to declare. A guest may only launch once it
+        // has actually received that declaration, so the two sides can never
+        // start the same heat under different rules.
+        if (!this.isHost && !this.remoteModeKnown) return;
+
+        this._launched = true;
+        // A completed series restarts clean on the next launch — both
+        // sides derive the reset from identical counts, so no drift.
+        if (this.mpFormat === 'tournament' && this.seriesDecided()) this._resetSeries();
+
+        // The host owns round identity. Minting it here means the id exists
+        // before the race starts, so the first input/sync of the new heat is
+        // already stamped and a late packet from the previous heat is
+        // recognisable the moment it lands.
+        if (this.isHost) {
+            this._roundSeq = (this._roundSeq + 1) % 0xFFFFFF;
+            this.roundId = this._roundSeq + '-' + Date.now().toString(36);
+        }
+        this.sendEvent({ type: 'round', roundId: this.roundId });
+        game.startRaceMode('multiplayer');
+    },
+
+    // True when the announced loadout names a car THIS build actually stocks.
+    // Proves the peer can be raced against, not that they paid for it — their
+    // save is client-local and there is no server that could answer that.
+    _remoteCarIsStocked() {
+        const name = this.remoteLoadout && this.remoteLoadout.name;
+        if (!name) return false;
+        const catalog = (typeof game !== 'undefined' && game.carDefs) ? game.carDefs : null;
+        if (!catalog) return false;
+        return catalog.some(d => d.name === name);
+    },
+
+    // True when `msg` belongs to the round currently being raced. Messages
+    // that require a round but arrive before one exists are stale by
+    // definition — there is no live race to apply them to.
+    _msgIsCurrentRound(msg) {
+        if (!msg || !msg.roundId) return false;
+        return !!this.roundId && msg.roundId === this.roundId;
     },
 
     _resetSeries() { this.series = { myWins: 0, theirWins: 0 }; },
@@ -1008,6 +1332,24 @@ const MP = {
         this._remoteOutcome = null;
         this._outcomeResolve = null;
         this._pendingCandidates = null;
+        // Round identity and false-start evidence belong to ONE heat on ONE
+        // connection. Leaving them behind was how a stale `localFalseStart`
+        // could reach the NEXT session's results screen — and that verdict is
+        // exactly what _applyMultiplayerOutcome() now trusts over the local
+        // claim, so a leftover `true` there reads as a disqualification the
+        // player never earned.
+        this.roundId = null;
+        this.localRevAt = null;
+        this.remoteRevAt = null;
+        this.remoteModeKnown = false;
+        this.goAt = null;
+        this.localFalseStart = null;
+        this._verdict = null;
+        this._verdictResolve = null;
+        this._peerFinish = null;
+        this._pendingFinish = null;
+        if (this._hostDecideTimer) { clearTimeout(this._hostDecideTimer); this._hostDecideTimer = 0; }
+        if (this._hostVerdictTimer) { clearTimeout(this._hostVerdictTimer); this._hostVerdictTimer = 0; }
         this._peerLostHandled = true; // we're tearing down on purpose
         if (this._discGraceTimer) { clearTimeout(this._discGraceTimer); this._discGraceTimer = null; }
         if (this._connectWatchdog) { clearTimeout(this._connectWatchdog); this._connectWatchdog = 0; }
@@ -1018,6 +1360,8 @@ const MP = {
         if (this.eventsChannel) { try { this.eventsChannel.close(); } catch (e) {} this.eventsChannel = null; }
         if (this.stateChannel) { try { this.stateChannel.close(); } catch (e) {} this.stateChannel = null; }
         if (this.pc) { try { this.pc.close(); } catch (e) {} this.pc = null; }
+        this._seatReady = false;
+        this._localIceQueue = [];
         if (this.roomRef) {
             try { this.roomRef.off(); if (this.isHost) this.roomRef.remove().catch(() => {}); } catch (e) {}
             this.roomRef = null;
@@ -1035,9 +1379,25 @@ const MP = {
         this._refreshQuickPair();
     },
 
+/* V10M1-ABORT-INVITE-WAIT */
     leaveMultiplayer() {
         this.disconnect();
         game.returnToMenu();
+    },
+
+    /* Invite-wait teardown (friends invite flow): the driver we invited
+       never answered inside the window. Stop hosting cleanly and put the
+       choice panel back so the INVITE button is free to use again without
+       a reload. Deliberately refuses to tear down a live or forming
+       handshake — callers check that too, this is the backstop. */
+    abortInviteWait(msg) {
+        if (this._connected) return;
+        this.disconnect();
+        this._show('mp-host-panel', false);
+        this._show('mp-join-panel', false);
+        this._show('mp-ready-panel', false);
+        this.status(msg || 'INVITE EXPIRED', 'err');
+        this._show('mp-choice', true);
     },
 
     async _reserveRoomCode() {
@@ -1066,6 +1426,10 @@ const MP = {
         // exception would unwind through the caller (usually a UI handler),
         // and these messages are all load-bearing (loadout, ready, outcome).
         // Never let a closed channel take the game down.
+        // Stamp the round on every message sent while a round is live, so no
+        // individual send site can forget to. Messages that require a round
+        // are checked against it on arrival.
+        if (this.roundId && obj.roundId === undefined) obj.roundId = this.roundId;
         try { dc.send(JSON.stringify(obj)); } catch (e) { /* channel closed mid-send */ }
     },
     sendState(obj) {
@@ -1087,6 +1451,7 @@ const MP = {
         if (congested && obj.type !== 'sync') return;
         // Even a sync is pointless if the buffer is far past recovery.
         if (dc.bufferedAmount > MP_STATE_BUFFER_HARD) return;
+        if (this.roundId && obj.roundId === undefined) obj.roundId = this.roundId;
         try { dc.send(JSON.stringify(obj)); } catch (e) { /* channel closed mid-send */ }
     },
 
@@ -1108,22 +1473,51 @@ const MP = {
     // Builds a REAL Car instance matching the opponent's actual stats, so
     // replaying their real inputs through it produces a faithful replica —
     // not a placeholder dot.
+    //
+    // The base car comes from OUR catalog, looked up by name. The loadout
+    // message is attacker-controlled input: before, the peer's own hp /
+    // weight / gearing were carried verbatim into the replica, so a crafted
+    // message could announce a 50,000 hp car and have BOTH sides render it as
+    // one. Now the name selects a catalog car and only upgrades, tune and
+    // cosmetics are taken from the message — each through the same sanitizer
+    // the local save goes through. A name we do not stock falls back to a
+    // generic rival rather than being invented on the spot.
+    //
+    // LIMITATION: this proves the car is one this build stocks. It does NOT
+    // prove the sender actually owns it — their save is client-local and we
+    // have no server to ask. See the security notes in the final report.
     buildOpponentCar() {
         const cd = this.remoteLoadout;
-        const def = cd ? {
-            name: cd.name, hp: cd.baseHp, weight: cd.baseWeight, grip: cd.baseGrip,
-            redline: cd.baseRedline, price: cd.price || 0, color: cd.color,
-            secondaryColor: cd.secondaryColor, type: cd.type, art: cd.art || cd.type,
-            gearRatios: cd.baseGearRatios, finalDrive: cd.baseFinalDrive, dragArea: cd.baseDragArea,
-            upgrades: cd.upgrades, tune: cd.tune,
-        } : {
+        const fallbackDef = {
             name: 'Opponent', hp: 200, weight: 1200, grip: 1, redline: 7000, price: 0,
             color: '#2196f3', secondaryColor: '#0d47a1', type: 'sedan', art: 'sedan',
             gearRatios: [0, 3.2, 2.2, 1.6, 1.2, 1.0], finalDrive: 3.9, dragArea: 0.75,
         };
+        const catalog = (typeof game !== 'undefined' && game.carDefs) ? game.carDefs : null;
+        const def = (cd && catalog)
+            ? (catalog.find(d => d.name === cd.name) || fallbackDef)
+            : fallbackDef;
+
         const car = new Car(def);
-        if (cd && cd.customization && typeof hydrateCustomization === 'function') {
-            try { car.customization = hydrateCustomization(cd.customization); } catch (e) {}
+        if (cd) {
+            car.upgrades = (typeof sanitizeUpgrades === 'function') ? sanitizeUpgrades(cd.upgrades) : def.upgrades;
+            if (typeof sanitizeTune === 'function') car.tune = sanitizeTune(cd.tune);
+            if (cd.customization && typeof hydrateCustomization === 'function') {
+                try { car.customization = hydrateCustomization(cd.customization); } catch (e) {}
+            }
+            // PAINT CONSISTENCY: the loadout carries the sender's real body +
+            // accent colors. They used to be ignored here — the replica was
+            // built straight from OUR catalog def, so the opponent's car wore
+            // the STOCK catalog color no matter what paint they had chosen.
+            // The colors are attacker-controllable input, so only hues that
+            // exist in OUR paint catalog are accepted; anything else (or a
+            // legacy peer that sent no color) falls back to the stock color.
+            const PAINTS = (typeof game !== 'undefined' && game.PAINTS) ? game.PAINTS : null;
+            const paintOk = v => typeof v === 'string' &&
+                !!PAINTS && PAINTS.some(pc => pc.hex.toLowerCase() === v.toLowerCase());
+            if (paintOk(cd.color)) car.color = cd.color;
+            if (paintOk(cd.secondaryColor)) car.secondaryColor = cd.secondaryColor;
+            car.applyUpgrades();
         }
         return car;
     },
@@ -1136,6 +1530,20 @@ const MP = {
         this.countdownStart = null;
         this._stagingFallbackAt = null;
         this._remoteOutcome = null;   // never leak the previous race's report
+        // False-start evidence belongs to ONE heat. Carrying it across a
+        // rematch would let last heat's rev timestamp condemn this heat's
+        // first throttle pull.
+        this.localRevAt = null;
+        this.remoteRevAt = null;
+        // A verdict already issued belongs to the round it was issued for.
+        this._verdictResolve = null;
+        this._verdict = null;
+        this.localFalseStart = null;  // no ruling yet for THIS round
+        this.goAt = null;             // green light not yet reached
+        this._peerFinish = null;
+        this._pendingFinish = null;
+        if (this._hostDecideTimer) { clearTimeout(this._hostDecideTimer); this._hostDecideTimer = 0; }
+        if (this._hostVerdictTimer) { clearTimeout(this._hostVerdictTimer); this._hostVerdictTimer = 0; }
         this._syncErr = 0;            // replica corrections start clean
         this._lastSyncT = 0;
         // Position-rate budget in _applySync is measured from the previous
@@ -1143,6 +1551,11 @@ const MP = {
         // last heat's origin and rejects the opening snapshots as too fast.
         this._lastSyncX = undefined;
         this._lastSyncAt = 0;
+        // Finish-time validation is measured from this round's accepted
+        // progress, so a rematch must not inherit the last heat's high-water
+        // mark (which would let a fresh race claim an impossibly quick time).
+        this._peerMaxX = 0;
+        this._peerMaxXAt = 0;
         this.remotePaused = false;
         this._pausedSince = 0;
         this._pausedSent = null;
@@ -1173,12 +1586,35 @@ const MP = {
         this._launched = false;
         this._remoteOutcome = null;
         this._outcomeResolve = null;
+        this._verdictResolve = null;
+        this._verdict = null;
         this.localRevved = false;
         this.remoteRevved = false;
         this.countdownStart = null;
         this._stagingFallbackAt = null;
         this._syncErr = 0;
         this._lastSyncT = 0;
+        // Round identity is per-heat. The next launch mints a fresh id, and
+        // until then every round-scoped message from the heat that just ended
+        // is recognisably stale and dropped rather than applied to the new one.
+        this.roundId = null;
+        this.localRevAt = null;
+        this.remoteRevAt = null;
+
+        // ── Rematch saved-car validation (Phase 1G) ───────────────────────
+        // The next heat's car comes back off persisted state. Re-validate it
+        // through the SAME path a fresh race uses, so a save that drifted
+        // (index pointing past the list, a car the player does not own, a
+        // name no longer in the catalog) cannot announce a car this player
+        // cannot actually drive. Validating here — BEFORE the loadout goes
+        // out — is what stops the peer being told about a phantom car that
+        // then fails to load on the next start.
+        if (typeof game !== 'undefined' && typeof game.ensureOwnedCar === 'function') {
+            game.ensureOwnedCar(true);
+        }
+        // Re-announce now so the peer's lobby card shows THIS heat's car
+        // rather than the previous heat's.
+        this.sendLoadout();
 
         game.state = 'MENU';
         game.menuState = 'MULTIPLAYER';
@@ -1187,21 +1623,17 @@ const MP = {
         document.querySelectorAll('.menu-overlay').forEach(el => el.classList.add('hidden'));
         const menu = document.getElementById('multiplayer-menu');
         if (menu) menu.classList.remove('hidden');
-        this._show('mp-choice', false);
-        this._show('mp-host-panel', false);
-        this._show('mp-join-panel', false);
-        this._show('mp-ready-panel', true);
+        this._renderLobbySelf();
+        // Panel, button and status all come from one derived render.
+        this._renderLobby();
         const btn = document.getElementById('mp-ready-btn');
-        if (btn) {
-            btn.classList.remove('hidden');
-            btn.removeAttribute('aria-hidden');
+        if (btn && !btn.classList.contains('hidden')) {
             btn.classList.add('mp-ready-glow');
             // Save a click: the rematch conversation is already open, so put
             // the READY UP button under the cursor / keyboard focus.
             try { btn.focus({ preventScroll: true }); } catch (e) {}
             setTimeout(() => btn.classList.remove('mp-ready-glow'), 2600);
         }
-        this._renderLobbySelf();
         // Opponent card: re-render from the still-known loadout + profile so
         // the lobby previews never go stale between heats.
         if (this.remoteLoadout) {
@@ -1254,6 +1686,20 @@ const MP = {
         }
 
         if (p.gas > 0.1) this.localRevved = true;
+
+        // False-start EVIDENCE, not a verdict. Record the instant throttle
+        // first went down while the light was still counting, on our own
+        // clock, exactly once. The host converts this into its own timeline
+        // and makes the call — we never rule on our own jump.
+        //
+        // Recording a TIMESTAMP rather than a boolean is the whole point: a
+        // boolean is judged against each client's own idea of what "before
+        // the light" means, which is precisely how two clients end up
+        // disagreeing about the same race.
+        if (this.localRevAt === null && p.gas > 0.1 && game.raceState === 'COUNTDOWN') {
+            this.localRevAt = performance.now();
+            this.sendEvent({ type: 'rev', roundId: this.roundId, revAt: this.localRevAt });
+        }
 
         const changed = p.gas !== this._lastGas || p.brake !== this._lastBrake || p.clutch !== this._lastClutch;
         if (changed || now - this._lastInputSend > 1000 / MP_INPUT_HZ) {
@@ -1361,52 +1807,283 @@ const MP = {
     // performance.now() timeline.
     calibrateClock() {
         if (this.isHost) return;
+        // A resync runs on top of a working offset, not instead of one. Keep
+        // the current value as the fallback: if the samples come back empty or
+        // the link dropped mid-measurement, the guest keeps the calibration it
+        // already had rather than snapping to a default.
+        const priorOffset = this.clockOffset;
         this._pongSamples = [];
         let sent = 0;
         const step = () => {
+            // The link may have closed while we were measuring. Stop, and keep
+            // whatever offset we already had.
+            if (!this._connected) { this.clockOffset = priorOffset; return; }
             if (sent >= 5) {
                 if (this._pongSamples.length) {
                     const best = this._pongSamples.reduce((a, b) => (a.rtt < b.rtt ? a : b));
-                    this.clockOffset = best.offset;
+                    const next = best.offset;
+                    // Apply live only a SMALL correction. A large jump means
+                    // the measurement itself is untrustworthy (a stalled tab,
+                    // a device that slept mid-race), and moving the shared
+                    // timeline that far mid-heat would be worse than the drift
+                    // we are trying to remove. Large jumps are ignored, which
+                    // leaves the old offset in place — the same fail-open rule
+                    // the false-start check uses.
+                    const delta = next - this.clockOffset;
+                    if (isFinite(delta) && Math.abs(delta) <= MP_CLOCK_MAX_FIX_MS) {
+                        this.clockOffset = next;
+                    } else if (!isFinite(this.clockOffset)) {
+                        // No usable offset at all (e.g. first calibration was
+                        // interrupted) — take the measurement as-is rather
+                        // than leaving the timeline undefined.
+                        this.clockOffset = next;
+                    }
                 }
+                this._clockCalibratedAt = performance.now();
                 return;
             }
             sent++;
             this.sendEvent({ type: 'ping', t0: performance.now() });
             setTimeout(step, 120);
         };
+        this._clockCalibratedAt = performance.now();
         step();
     },
 
-    // Sends this side's race result and waits (briefly) for the peer's
-    // matching report so both sides agree on the outcome before either
-    // applies a reward. Falls back to locally-observed data on timeout
-    // (e.g. the peer disconnected right at the line).
-    reportOutcome(local, fallbackRemote, callback) {
-        this.sendEvent({ type: 'raceOutcome', falseStart: !!local.falseStart, finishTime: local.finishTime ?? 999 });
+    /* Called from the render loop. The calibration used to be taken once at
+     * connect and trusted for the rest of the session; over a long heat on a
+     * phone that drifts enough to move a guest's rev stamp across the green
+     * light and hand them a false start they never committed.
+     *
+     * Cheap: a handful of small messages every MP_CLOCK_RESYNC_MS, on the
+     * already-open reliable channel, only while a race is actually live. */
+    maybeResyncClock() {
+        if (this.isHost || !this._connected) return;
+        if (typeof game === 'undefined' || game.state !== 'RACE') return;
+        if (!this._lastSync) return;   // race hasn't started streaming yet
+        const now = performance.now();
+        if (now - (this._clockCalibratedAt || 0) < MP_CLOCK_RESYNC_MS) return;
+        this.calibrateClock();
+    },
 
-        // The peer may have finished BEFORE us — their report arrives while
-        // nobody is listening yet. It's stored, not dropped, so use it now.
-        if (this._remoteOutcome) {
-            const remote = this._remoteOutcome;
-            this._remoteOutcome = null;
-            callback(remote);
+    // ── Authoritative outcome ──────────────────────────────────────────
+    // The old flow had BOTH clients declare their own falseStart and both
+    // clients combine them locally. That is the desync: one side judged "I
+    // did not jump" from its own state and real speed while the other judged
+    // the same player from its own light state and a throttled, possibly
+    // stale replica — so one player saw a clean race and the other saw a
+    // false start, and the loser got yanked to the lobby mid-race.
+    //
+    // Now the HOST rules. Each side reports EVIDENCE (a timestamped rev and a
+    // finish time); the host compares every timestamp against its own clock
+    // and publishes ONE verdict that both sides apply verbatim. There is no
+    // second client that can form its own opinion.
+
+    // Converts a guest-clock timestamp into the host's timeline.
+    _toHostClock(t) {
+        if (typeof t !== 'number' || !isFinite(t)) return null;
+        return t + (this.clockOffset || 0);
+    },
+
+    // The single false-start decision. `revAt` must already be in HOST time;
+    // `goAt` is when the host's light went green.
+    _decideFalseStart(revAt, goAt) {
+        if (typeof revAt !== 'number' || !isFinite(revAt)) return false;
+        if (typeof goAt !== 'number' || !isFinite(goAt)) return false;
+        // Plausibility gate. A "rev" stamp implausibly far from the light is
+        // not a launch decision — it is a stale clock calibration or a
+        // crafted message, and convicting someone on it would be worse than
+        // missing a jump. Only near-GO stamps can produce a false start.
+        if (Math.abs(revAt - goAt) > MP_REV_PLAUSIBLE_MS) return false;
+        return revAt < goAt;
+    },
+
+    _sanitizeFinishTime(v) {
+        return (typeof v === 'number' && isFinite(v))
+            ? Math.min(Math.max(v, 2), 999) : 999;
+    },
+
+    /* Host-side check on a PEER's claimed finish time.
+     *
+     * The finish number a guest sends is a plain claim, and clamping it into
+     * [2,999] says nothing about whether it is real — a guest that wants to
+     * win in 2.001s simply sends 2.001. That made the one value which decides
+     * the race the only piece of it that was taken on faith, while every
+     * other input (gas, position) was validated.
+     *
+     * The host does not need to simulate the peer to check it. It already
+     * runs the peer's car from their real inputs, and it records the furthest
+     * position it has ACCEPTED on the sync channel (_peerMaxX, stamped on the
+     * host clock). From that we can ask a question no liar can answer
+     * cheaply: even at the fastest speed the physics allows, could you have
+     * reached the line by the moment you claim?
+     *
+     *     earliest possible = (time already elapsed) + (distance left / cap)
+     *
+     * Anything faster than that is not a good run, it is a fabricated one.
+     *
+     * Deliberately one-directional: this can only ever make a peer's time
+     * SLOWER, never faster. A guest with an honest run is never slowed,
+     * because their real accepted snapshots put them at/near the line at
+     * close to their real time, and MP_PEER_MAX_SPEED sits far above anything
+     * the cars can actually reach. Worst case the correction does nothing.
+     */
+    _validatePeerFinish(claimed) {
+        const t = this._sanitizeFinishTime(claimed);
+        // Only the host can validate — the guest has no independent record of
+        // the host's progress, and must not pretend to.
+        if (!this.isHost) return t;
+        // No accepted progress yet, or the green light was never stamped: we
+        // have no baseline to measure against, so we do not invent one.
+        // Tested the same way _decideFalseStart tests its timestamps — a
+        // truthiness check here would silently reject a legitimate 0.
+        if (typeof this.goAt !== 'number' || !isFinite(this.goAt)) return t;
+        if (!this._peerMaxX || !this._peerMaxXAt) return t;
+
+        const raceDistance = (typeof game !== 'undefined' && game.raceDistance)
+            ? game.raceDistance : 0;
+        if (!raceDistance) return t;
+
+        const remaining = Math.max(0, raceDistance - this._peerMaxX);
+        // A HARD floor: the host did not accept the peer at this far until
+        // _peerMaxXAt, so no claim earlier than that can be true. Nothing is
+        // subtracted from it.
+        const elapsed = Math.max(0, (this._peerMaxXAt - this.goAt) / 1000);
+        // Time still needed for the rest of the strip at the speed cap, less a
+        // small tolerance. This is the only uncertain term — the final sync
+        // is up to MP_SYNC_MS stale, so a peer legitimately sitting just short
+        // of the line when it finished would otherwise be "caught" by a few
+        // centimetres. Capped at zero so it can never eat into `elapsed`.
+        const needed = Math.max(0, (remaining / MP_PEER_MAX_SPEED) - MP_FINISH_SLACK_MS / 1000);
+        const earliest = elapsed + needed;
+        // Never returns a time below the 2s floor the sanitiser enforces.
+        return Math.max(t, Math.max(2, earliest));
+    },
+
+    // Sends this side's EVIDENCE, then waits for the single authoritative
+    // verdict. Host produces it; guest consumes it.
+    reportOutcome(local, fallbackRemote, callback) {
+        const roundId = this.roundId;
+        // Evidence, not a claim: "I reached the line at T and I first touched
+        // throttle at R". No verdict is attached.
+        this.sendEvent({
+            type: 'raceEnd', roundId,
+            finishTime: local.finishTime ?? 999,
+            revAt: this.localRevAt,
+        });
+
+        this._pendingFinish = { local, callback, roundId };
+
+        if (this.isHost) {
+            // The peer may have finished first; its report may already be
+            // parked. Decide as soon as we have both sides' evidence.
+            this._tryHostDecide(false);
+            if (this._pendingFinish) {
+                if (this._hostDecideTimer) clearTimeout(this._hostDecideTimer);
+                this._hostDecideTimer = setTimeout(() => {
+                    this._hostDecideTimer = 0;
+                    this._tryHostDecide(true);
+                }, MP_OUTCOME_TIMEOUT_MS);
+            }
             return;
         }
 
+        // Guest: wait for the host's ruling. On timeout (host vanished
+        // mid-outcome) fall back to locally-observed data rather than
+        // hanging on the results screen forever.
         let done = false;
-        this._outcomeResolve = (remote) => {
+        const finish = (remote) => {
             if (done) return;
             done = true;
-            this._outcomeResolve = null;
+            this._pendingFinish = null;
             callback(remote);
         };
-        setTimeout(() => {
+        this._verdictResolve = finish;
+        // The verdict can legitimately arrive BEFORE we report: the host may
+        // have already decided from its own finish plus our sync-state, or we
+        // simply crossed the line second and its report overtook ours. Consume
+        // the parked verdict now instead of stalling for a second on a timer
+        // that has already been answered.
+        if (this._verdict) {
+            const v = this._verdict;
+            this._verdict = null;
+            finish(v);
+            return;
+        }
+        if (this._hostVerdictTimer) clearTimeout(this._hostVerdictTimer);
+        this._hostVerdictTimer = setTimeout(() => {
+            this._hostVerdictTimer = 0;
             if (done) return;
-            done = true;
-            this._outcomeResolve = null;
-            callback(fallbackRemote);
-        }, MP_OUTCOME_TIMEOUT_MS);
+            game.showNotification('NO VERDICT FROM HOST');
+            finish(fallbackRemote);
+        }, MP_OUTCOME_TIMEOUT_MS * 2);
+    },
+
+    // Host only. Publishes the one verdict both sides will apply.
+    _tryHostDecide(timedOut) {
+        if (!this.isHost) return;
+        const pf = this._pendingFinish;
+        if (!pf) return;
+        if (!this._peerFinish && !timedOut) return;
+        this._pendingFinish = null;
+        if (this._hostDecideTimer) { clearTimeout(this._hostDecideTimer); this._hostDecideTimer = 0; }
+
+        const peer = this._peerFinish;
+        this._peerFinish = null;
+
+        // Our own rev stamp is already in host time; the guest's is not.
+        const myRev = this.localRevAt;
+        const theirRev = peer ? this._toHostClock(peer.revAt) : null;
+
+        // This is the ONLY false-start decision in the system.
+        const myFS = this._decideFalseStart(myRev, this.goAt);
+        const theirFS = this._decideFalseStart(theirRev, this.goAt);
+
+        // Whatever each side claimed locally is overwritten here. A guest
+        // that thought it was disqualified for a jump it did not make, and a
+        // host that thought it was clean after jumping, both get the host's
+        // single reading.
+        const verdict = {
+            roundId: pf.roundId || this.roundId,
+            host: { falseStart: myFS, finishTime: this._sanitizeFinishTime(pf.local.finishTime) },
+            guest: {
+                falseStart: theirFS,
+                // Validated, not just clamped: the guest's number is checked
+                // against how far the host actually accepted it travelling.
+                finishTime: peer ? this._validatePeerFinish(peer.finishTime) : 999,
+            },
+        };
+
+        // Publish BEFORE applying, so the peer is never left waiting on a
+        // result we have already shown ourselves.
+        this.sendEvent({ type: 'raceVerdict', roundId: this.roundId, verdict });
+
+        // The host's own view of the peer.
+        this.localFalseStart = verdict.host.falseStart;
+        pf.callback(verdict.guest);
+    },
+
+    // Guest only: translate the host's verdict into this client's
+    // perspective and apply it verbatim.
+    _applyHostVerdict(v) {
+        if (!v || typeof v !== 'object') return false;
+        const hostSide = v.host || {};
+        const guestSide = v.guest || {};
+        // We are the guest, so the host's entry is OUR result.
+        this.localFalseStart = !!hostSide.falseStart;
+        const remote = {
+            falseStart: !!guestSide.falseStart,
+            finishTime: this._sanitizeFinishTime(guestSide.finishTime),
+        };
+        const resolve = this._verdictResolve;
+        if (resolve) {
+            this._verdictResolve = null;
+            if (this._hostVerdictTimer) { clearTimeout(this._hostVerdictTimer); this._hostVerdictTimer = 0; }
+            resolve(remote);
+        } else {
+            this._verdict = remote;
+        }
+        return true;
     },
 
     _handleMessage(msg) {
@@ -1433,7 +2110,15 @@ const MP = {
                     const stats = document.getElementById('mp-opp-stats');
                     if (name && !this.remoteProfile) name.textContent = String(msg.car.name || 'UNKNOWN CAR').toUpperCase();
                     if (stats) {
-                        stats.textContent = String(msg.car.name || '').toUpperCase() + ' \u00B7 ' +
+                        // Paint name reflects the peer's REAL choice (their
+                        // loadout color), matching what the showroom preview
+                        // and the race replica now render.
+                        const PAINTS = (typeof game !== 'undefined' && game.PAINTS) ? game.PAINTS : null;
+                        const peerPaint = (PAINTS && typeof msg.car.color === 'string')
+                            ? PAINTS.find(pc => pc.hex.toLowerCase() === msg.car.color.toLowerCase()) : null;
+                        const paintLabel = (peerPaint && typeof game.paintName === 'function')
+                            ? ' \u00B7 ' + game.paintName(peerPaint.hex).toUpperCase() : '';
+                        stats.textContent = String(msg.car.name || '').toUpperCase() + paintLabel + ' \u00B7 ' +
                             (typeof msg.car.baseHp === 'number' ? Math.round(msg.car.baseHp) + ' HP' : '---') + ' \u00B7 ' +
                             (typeof msg.car.baseWeight === 'number' ? Math.round(msg.car.baseWeight) + ' KG' : '---');
                     }
@@ -1511,16 +2196,18 @@ const MP = {
                 break;
             }
             case 'mode':
-                this.mpFormat = msg.mode === 'tournament' ? 'tournament' : 'drag';
+                // Only the host's format ever takes effect. A guest that calls
+                // setMode() anyway is refused there, but the rule is enforced
+                // HERE too — this is the check that matters, because it is the
+                // one the host applies to an incoming message. A guest sending
+                // "tournament" cannot change the race it is about to play.
+                if (this.isHost) break;
+                this.remoteModeKnown = true;
+                this.mpFormat = (msg.mode === 'tournament') ? 'tournament' : 'drag';
                 this.series = null; // format switch abandons any running series
                 this._refreshModeUI();
                 game.showNotification(this.mpFormat === 'tournament' ? 'TOURNAMENT — FIRST TO 2 WINS' : 'SINGLE DRAG RACE');
-                {
-                    const rp = document.getElementById('mp-ready-panel');
-                    if (rp && !rp.classList.contains('hidden')) {
-                        this.status(this.mpFormat === 'tournament' ? 'HEAT 1/3 · FIRST TO 2 WINS — READY UP' : 'REMATCH? BOTH HIT READY UP', 'ok');
-                    }
-                }
+                this._renderLobby();
                 break;
             case 'ready':
                 this.remoteReady = true;
@@ -1552,6 +2239,10 @@ const MP = {
                 }
                 break;
             case 'input':
+                // Per-tick input is round-scoped: a packet from a heat that has
+                // already ended must not feed this round's replica, nor revive
+                // the "opponent revved" flag that gates the countdown.
+                if (!this._msgIsCurrentRound(msg)) break;
                 this.remoteRevved = this.remoteRevved || msg.gas > 0.1;
                 if (game.opponentCar) {
                     // Clamp remote inputs into their real range — a tampered
@@ -1563,6 +2254,9 @@ const MP = {
                 }
                 break;
             case 'sync':
+                // Same rule as input — a stale snapshot from a finished heat
+                // is dropped rather than dragging the replica backward.
+                if (!this._msgIsCurrentRound(msg)) break;
                 this._applySync(msg);
                 break;
             case 'shiftUp':
@@ -1591,23 +2285,44 @@ const MP = {
                 if (this._pongSamples.length > 12) this._pongSamples.shift();
                 break;
             }
-            case 'raceOutcome': {
+            case 'round': {
+                // The host mints round identity; the guest adopts it. From
+                // here on, anything stamped with a different round is from a
+                // heat that already ended.
+                if (this.isHost) break;              // host does not take orders
+                this.roundId = String(msg.roundId || '').slice(0, 40);
+                break;
+            }
+            case 'rev': {
+                // Guest's throttle-down timestamp, in the GUEST's clock.
+                // Convert into ours and keep it as evidence. Nothing is
+                // decided here.
+                if (!this._msgIsCurrentRound(msg)) break;
+                if (this.isHost) this.remoteRevAt = this._toHostClock(msg.revAt);
+                break;
+            }
+            case 'raceEnd': {
+                // Evidence: peer reached the line at T and first touched
+                // throttle at R. No verdict attached — the host rules.
+                if (!this._msgIsCurrentRound(msg)) break;
                 const report = {
-                    falseStart: !!msg.falseStart,
-                    // Sanity floor: no build in this game runs 402m in under
-                    // 2s — a faster "finish" is manipulated or corrupted, so
-                    // clamp rather than hand out a bogus loss.
-                    finishTime: (typeof msg.finishTime === 'number' && isFinite(msg.finishTime))
-                        ? Math.min(Math.max(msg.finishTime, 2), 999) : 999,
+                    finishTime: this._sanitizeFinishTime(msg.finishTime),
+                    revAt: (typeof msg.revAt === 'number' && isFinite(msg.revAt)) ? msg.revAt : null,
                 };
-                if (this._outcomeResolve) {
-                    const resolve = this._outcomeResolve;
-                    this._outcomeResolve = null;
-                    resolve(report);
+                if (this.isHost) {
+                    this._peerFinish = report;
+                    // Both sides' evidence may now be in hand.
+                    this._tryHostDecide(false);
                 } else {
-                    // We haven't finished yet — keep it for reportOutcome().
                     this._remoteOutcome = report;
                 }
+                break;
+            }
+            case 'raceVerdict': {
+                // The single authoritative result, from the host.
+                if (!this._msgIsCurrentRound(msg)) break;
+                if (this.isHost) break;              // only the host issues one
+                this._applyHostVerdict(msg.verdict);
                 break;
             }
         }
@@ -1659,6 +2374,14 @@ const MP = {
         // closes the remaining hole where target=0 yanked the car to the line.
         if (target < prevX - budget) target = prevX - budget;
         if (target < 0) target = 0;
+        // Record how far the HOST has accepted the peer getting, so a claimed
+        // finish time can be checked against it later. `target` is already
+        // rate-validated above, so this high-water mark cannot itself be
+        // pushed forward faster than physics allows.
+        if (this.isHost && target > this._peerMaxX) {
+            this._peerMaxX = target;
+            this._peerMaxXAt = now;
+        }
         const dx = target - o.x;
         if (Math.abs(dx) > 3) {
             o.x = target;

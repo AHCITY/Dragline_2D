@@ -30,7 +30,14 @@ body {
 }
 canvas {
     display: block;
-    image-rendering: pixelated;
+    /* No `image-rendering: pixelated`. Every canvas in this game is drawn with
+       anti-aliased VECTOR work - gradient-filled bodywork, quadratic body
+       panels, stroked spokes - so nearest-neighbour scaling was the wrong
+       resampling for every one of them. On a non-integer backing-store ratio
+       (a 340x120 preview CSS-stretched to 300px, or a 1.25x DPR phone) it
+       replaced smooth edges with hard blocky steps, which read as "blurry"
+       once the artwork is scaled up in the garage. Browsers already pick the
+       right filter when this is left alone. */
     width: 100%; height: 100%;
     touch-action: none;
 }
@@ -413,11 +420,6 @@ input.pause-vol:focus-visible { outline: 1px dashed #ffeb3b; outline-offset: 2px
 .scroll-container::-webkit-scrollbar { width: 6px; }
 .scroll-container::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
 .scroll-container::-webkit-scrollbar-track { background: #222; }
-/* Garage car list: capped so the customizer below always stays visible. */
-.scroll-container.garage-list {
-    flex: 0 1 auto;
-    max-height: 24vh;
-}
 .shop-item, .car-item {
     display: flex; justify-content: space-between;
     align-items: center;
@@ -431,7 +433,38 @@ input.pause-vol:focus-visible { outline: 1px dashed #ffeb3b; outline-offset: 2px
     flex: 0 0 auto;
     user-select: none; -webkit-user-select: none;
 }
+/* V10S2-SHOP-ICON-CSS */
 .shop-item:hover, .car-item:hover { background: #2a2a2a; border-color: #666; }
+/* ─── Performance shop: part icon integration ───────────────────────────
+   .shop-item stays a column (tune rows and the TUNE SETUP heading reuse
+   it unchanged); upgrade rows wrap icon + content in .shop-item-main.
+   Icons are inline SVG — nothing to download, nothing to 404. */
+.shop-item-main {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-width: 0;
+}
+.shop-icon {
+    flex: 0 0 auto;
+    width: clamp(36px, 9vw, 50px);
+    aspect-ratio: 1 / 1;
+    background: linear-gradient(180deg, #23262c 0%, #17191d 100%);
+    border: 1px solid #3a3f4a;
+    border-radius: 6px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 2px 2px 0 rgba(0,0,0,0.5);
+    padding: 4px;
+    box-sizing: border-box;
+}
+.shop-icon svg { width: 100%; height: 100%; display: block; }
+.shop-item-body { flex: 1 1 auto; min-width: 0; }
+body.mobile .shop-icon { width: clamp(30px, 8vw, 42px); }
+@media (max-width: 480px) {
+    .shop-item-main { gap: 9px; }
+    .shop-icon { width: 32px; padding: 3px; }
+}
 .shop-item { flex-direction: column; align-items: flex-start; }
 .shop-item-header {
     width: 100%;
@@ -442,6 +475,97 @@ input.pause-vol:focus-visible { outline: 1px dashed #ffeb3b; outline-offset: 2px
 .shop-item-detail { font-size: 9px; color: #888; margin-top: 8px; text-align: left; line-height: 1.4; }
 .car-item.owned { border-left: 5px solid #4caf50; }
 .car-item.selected { border: 2px solid #ffeb3b; background: #2c2c22; }
+
+/* V10S1-INVITE-CARD-CSS */
+/* ─── Incoming race invitation cards (friends invite flow) ─────────────
+   Fixed to the right edge, slightly above vertical center, stacked when
+   several friends invite at once. Above .menu-overlay (z 10) and the
+   toast (z 20), below the prompts (z 99998+). */
+#race-invite-stack {
+    position: fixed;
+    top: 38vh;
+    right: max(14px, env(safe-area-inset-right));
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    align-items: flex-end;
+    z-index: 30;
+    pointer-events: none;
+    max-width: min(340px, calc(100vw - 24px));
+}
+.ri-card {
+    pointer-events: auto;
+    position: relative;
+    overflow: hidden;
+    background: rgba(16, 18, 22, 0.97);
+    border: 1px solid #3a3f4a;
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.55);
+    padding: 10px 12px 11px;
+    width: min(320px, calc(100vw - 24px));
+    opacity: 1;
+    transform: translateX(0);
+    transition: opacity 0.28s ease, transform 0.28s ease;
+}
+.ri-card.ri-in { opacity: 0; transform: translateX(26px); }
+.ri-card.ri-out { opacity: 0; transform: translateX(26px); }
+.ri-title {
+    font-size: 10px;
+    line-height: 1.55;
+    color: #ffeb3b;
+    text-shadow: 2px 2px 0 #000;
+    letter-spacing: 0.5px;
+    word-break: break-word;
+}
+.ri-actions { display: flex; gap: 8px; margin-top: 9px; }
+.ri-btn {
+    flex: 1 1 0;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 34px;
+    text-align: center;
+    font-size: 9px;
+    letter-spacing: 0.5px;
+    padding: 8px 6px;
+    border: 1px solid #3a3f4a;
+    background: #1c2026;
+    color: #fff;
+    text-shadow: 1px 1px 0 #000;
+    cursor: pointer;
+    user-select: none; -webkit-user-select: none;
+    box-sizing: border-box;
+}
+.ri-btn:hover { filter: brightness(1.18); }
+.ri-btn:active { transform: translate(1px, 1px); }
+.ri-btn:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+.ri-accept { background: #143c1c; border-color: #2e7d32; color: #7ee787; }
+.ri-accept:hover { background: #1a4c24; }
+.ri-decline { background: #3c1414; border-color: #8c2b2b; color: #ff8a80; }
+.ri-decline:hover { background: #4c1a1a; }
+.ri-timer {
+    position: absolute;
+    left: 0; bottom: 0;
+    height: 3px;
+    width: 100%;
+    background: #ff9800;
+    opacity: 0.85;
+}
+@media (max-width: 700px) {
+    #race-invite-stack { top: 34vh; right: 10px; }
+    .ri-card { width: min(280px, calc(100vw - 20px)); padding: 9px 10px 10px; }
+    .ri-title { font-size: 9px; }
+    .ri-btn { font-size: 8px; min-height: 32px; padding: 8px 5px; }
+}
+@media (max-height: 420px) {
+    /* Short landscape phones: tuck higher + tighter so the card never
+       crowds the rev zone or the bottom corner controls. */
+    #race-invite-stack { top: 16vh; }
+    .ri-card { width: min(250px, calc(100vw - 20px)); }
+    .ri-actions { margin-top: 6px; }
+    .ri-btn { min-height: 28px; padding: 6px 5px; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .ri-card { transition: opacity 0.15s ease; transform: none; }
+    .ri-card.ri-in, .ri-card.ri-out { transform: none; }
+}
 
 #notification {
     position: absolute;
@@ -581,9 +705,7 @@ body.mobile .menu-grid { margin-top: clamp(36px, 10vh, 80px); width: 280px; }
 body.mobile .menu-btn { padding: clamp(9px, 2.4vh, 16px) 10px; font-size: clamp(9px, 2.6vh, 12px); }
 body.mobile h1 { font-size: clamp(20px, 6vh, 32px); }
 body.mobile h2 { font-size: clamp(13px, 3.6vh, 18px); }
-body.mobile .shop-item, body.mobile .car-item { width: 92%; padding: clamp(8px, 2vh, 12px); }
-body.mobile .scroll-container.garage-list { max-height: 26vh; }
-/* Inputs ≥16px prevent iOS Safari from auto-zooming the whole stage. */
+body.mobile .shop-item, body.mobile .car-item { width: 92%; padding: clamp(8px, 2vh, 12px); }/* Inputs ≥16px prevent iOS Safari from auto-zooming the whole stage. */
 body.mobile .mp-code-input,
 body.mobile .pf-name-input,
 body.mobile .fr-add-input { font-size: 16px; }
@@ -638,9 +760,7 @@ body.mobile.portrait .menu-grid {
 }
 body.mobile.portrait .menu-btn { padding: 10px 4px; font-size: 9px; }
 body.mobile.portrait h1 { font-size: 17px; margin-bottom: 6px; }
-body.mobile.portrait h2 { font-size: 13px; margin-bottom: 8px; padding-bottom: 5px; }
-body.mobile.portrait .scroll-container.garage-list { max-height: 64px; }
-body.mobile.portrait .fr-list { max-height: 84px; }
+body.mobile.portrait h2 { font-size: 13px; margin-bottom: 8px; padding-bottom: 5px; }body.mobile.portrait .fr-list { max-height: 30vh; }
 /* The customizer is the tallest console — on the short rotated stage it
    scrolls INTERNALLY (never the page) while BACK stays visible. */
 body.mobile.portrait .gar-custom {
@@ -654,6 +774,7 @@ body.mobile.portrait .gar-custom::-webkit-scrollbar { width: 5px; }
 body.mobile.portrait .gar-custom::-webkit-scrollbar-thumb { background: #3a3f4a; }
 body.mobile.portrait .gar-rows { max-height: none; overflow: visible; }
 body.mobile.portrait #garage-preview { width: 200px; }
+body.mobile.portrait .gar-stage { width: min(560px, 94vh); }
 body.mobile.portrait .gar-row { min-height: 34px; }
 body.mobile.portrait .results-card { padding: 10px 12px; }
 body.mobile.portrait .results-row { font-size: 9px; margin: 6px 0; }
@@ -670,9 +791,7 @@ body.mobile.portrait .btn-pedal.brake { height: 65px; }
 body.mobile.portrait.has-nos .btn-pedal { width: 45px; }
 body.mobile.portrait.has-nos .btn-pedal.btn-nos { width: 47px; }
 body.mobile.portrait .hud { font-size: 9px; padding: 8px 45px 8px 8px; }
-body.mobile.portrait .hud #race-timer { font-size: 14px; }
-body.mobile.portrait .scroll-container.garage-list { max-height: 30vh; }
-body.mobile.portrait .mp-panel,
+body.mobile.portrait .hud #race-timer { font-size: 14px; }body.mobile.portrait .mp-panel,
 body.mobile.portrait .gar-custom { width: min(560px, 94vh); padding: 14px 16px 12px; }
 body.mobile.portrait .mp-status { min-height: 22px; margin: 8px 0 2px; }
 body.mobile.portrait .mp-code-display { font-size: 26px; padding: 10px 14px 8px; margin-bottom: 10px; }
@@ -1043,6 +1162,51 @@ body.mobile .mp-rematch-btn { margin-top: 14px; }
 }
 #results-menu:not(.hidden) .result-winner { animation: results-card-in 0.26s ease-out; }
 .result-winner.hidden { display: none; }
+
+/* ── Results polish: verdict aura, timeslip stagger, prize payout ──
+   Three small details that make the slipsheet read like a race receipt:
+   the headline gets an outcome-colored halo, the rows land one after
+   another like a printer walking the slip, and the prize ticks up with
+   a gold-green pulse when it pays. All decorative — every value on the
+   screen is still set through textContent/innerText with dev-owned
+   constants, and reduced-motion readers skip straight to the final
+   states (kill switches at the bottom of this block). */
+.result-title.outcome-win {
+    text-shadow: 3px 3px 0 #000, 0 0 30px rgba(76, 175, 80, 0.38), 0 0 4px rgba(76, 175, 80, 0.25);
+}
+.result-title.outcome-loss {
+    text-shadow: 3px 3px 0 #000, 0 0 30px rgba(244, 67, 54, 0.32), 0 0 4px rgba(244, 67, 54, 0.20);
+}
+#results-menu:not(.hidden) .results-row {
+    animation: results-row-in 0.28s ease-out backwards;
+}
+#results-menu:not(.hidden) .results-row:nth-child(1) { animation-delay: 0.05s; }
+#results-menu:not(.hidden) .results-row:nth-child(2) { animation-delay: 0.11s; }
+#results-menu:not(.hidden) .results-row:nth-child(3) { animation-delay: 0.17s; }
+#results-menu:not(.hidden) .results-row:nth-child(4) { animation-delay: 0.23s; }
+#results-menu:not(.hidden) .results-row:nth-child(5) { animation-delay: 0.29s; }
+@keyframes results-row-in {
+    from { opacity: 0; transform: translateX(-10px); }
+    to   { opacity: 1; transform: none; }
+}
+/* Prize paid: one gold-green pulse the moment the count-up lands. */
+.results-value-prize.prize-paid {
+    animation: prize-paid-pulse 0.7s ease-out 1;
+}
+@keyframes prize-paid-pulse {
+    0%   { text-shadow: 0 0 0 rgba(255, 235, 59, 0); color: #4caf50; }
+    35%  { text-shadow: 0 0 14px rgba(255, 235, 59, 0.85); color: #ffeb3b; }
+    100% { text-shadow: 0 0 6px rgba(76, 175, 80, 0.35); color: #4caf50; }
+}
+@media (prefers-reduced-motion: reduce) {
+    #results-menu .results-row,
+    .results-value-prize.prize-paid { animation: none !important; }
+    .result-title.outcome-win,
+    .result-title.outcome-loss { text-shadow: 3px 3px 0 #000; }
+}
+
+/* Quick-race RACE AGAIN rides the MP rematch slot (.mp-rematch-btn already
+   carries the orange invite + pulse); only the label differs per mode. */
 .result-winner-av {
     width: 46px;
     height: 46px;
@@ -1123,6 +1287,95 @@ body.mobile .mp-rematch-btn { margin-top: 14px; }
     from { opacity: 0; transform: translateY(10px) scale(0.985); }
     to   { opacity: 1; transform: none; }
 }
+/* ─── GARAGE STAGE — preview + car navigation arrows ───────────────
+   The top car-list is gone: the stage IS the car selector. The arrows
+   overlay the canvas margins (the art keeps clear side padding), share
+   .gar-arrow's icon language, and stay ≥44px for thumbs. */
+.gar-stage {
+    width: min(560px, 94vw);
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+    flex: 0 0 auto;
+}
+/* SCALE-1: both wrappers are EXPLICITLY sized off the fixed-width stage
+   (.gar-stage) instead of shrink-to-fit. A fit-content box takes its
+   max-content size from the canvas's INTRINSIC (attribute) size — and the
+   attribute is the backing store this same box feeds — so on any viewport
+   where the max-width caps did not bind, measure→attribute→layout→measure
+   grew the preview every redraw. Percentage widths end the cycle: layout
+   can no longer see the backing store at all. */
+.gar-stage-frame {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+}
+.gar-canvas-box {
+    position: relative;
+    display: inline-block;
+    width: 100%;
+    max-width: 100%;
+}
+.gar-nav-btn {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 44px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(20, 23, 30, 0.82);
+    border: 2px solid #455a64;
+    color: #eceff1;
+    font-size: 15px;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    box-shadow: 3px 3px 0 rgba(0,0,0,0.8);
+    transition: background 0.08s, border-color 0.08s, color 0.08s;
+    z-index: 2;
+}
+#gar-prev { left: 8px; }
+#gar-next { right: 8px; }
+.gar-nav-btn:hover { color: #fff; border-color: #78909c; background: rgba(35, 43, 54, 0.95); }
+.gar-nav-btn:active { transform: translateY(-50%) translate(2px, 2px); box-shadow: 0 0 0 #000; }
+.gar-nav-btn:focus-visible { outline: 2px solid #ffeb3b; outline-offset: 2px; }
+.gar-nav-btn.gar-nav-disabled { opacity: 0.3; pointer-events: none; }
+.gar-stage-info {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    flex-wrap: wrap;
+    margin-top: 7px;
+    font-size: 8px;
+    letter-spacing: 1px;
+    color: #9aa0aa;
+    text-shadow: 1px 1px 0 #000;
+}
+.gar-stage-name { color: #ffeb3b; font-size: 10px; }
+.gar-stage-stats { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.gar-stage-meta { display: inline-flex; align-items: center; gap: 7px; }
+.gar-stage-idx { color: #0d0e12; background: #9aa0aa; padding: 2px 5px; font-size: 7px; }
+.gar-stage-driving { color: #69f0ae; font-size: 7px; letter-spacing: 2px; }
+.gar-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    font-size: 9px;
+    letter-spacing: 2px;
+    line-height: 2.2;
+    color: #5a6070;
+    background: #08090b;
+    z-index: 3;
+}
 .gar-title {
     font-size: 11px;
     color: #9aa0aa;
@@ -1141,9 +1394,26 @@ body.mobile .mp-rematch-btn { margin-top: 14px; }
         #08090b;
     border: 2px solid #2c2f38;
     box-shadow: inset 0 0 24px rgba(0,0,0,0.8);
-    margin-bottom: 10px;
+    /* SCALE-1: the canvas box is now always 100% of the stage frame, so the
+       narrower media-query canvases (portrait 200px / short 300px) need auto
+       side margins to stay centered inside it. */
+    margin: 0 auto;
     max-width: 100%;
+    display: block;
+    /* SCALE-2-ASPECT: the layout height used to come from "height:auto",
+       which for a canvas resolves through its OWN attribute aspect ratio —
+       the backing store fed the layout, the layout fed the next backing
+       store, and every redraw inched the preview toward a square (the
+       "car grows every time I change paint" bug). A fixed aspect-ratio
+       decouples layout from the attributes entirely: same 680x240
+       proportion at every breakpoint, and the backing store can never
+       change what the layout measures. */
+    aspect-ratio: 680 / 240;
     height: auto;
+    /* Scale to the stage box (never its 680px attribute width): stops the
+       preview overflowing narrow windows between breakpoints. The explicit
+       media-query widths (portrait 200px, short-landscape 300px) still win. */
+    width: 100%;
 }
 .gar-quick { display: flex; gap: 10px; margin-bottom: 12px; }
 .gar-quick-btn {
@@ -1316,6 +1586,12 @@ body.mobile .gar-value { font-size: 9px; }
 body.mobile .gar-quick-btn { padding: 10px 14px; font-size: 8px; }
 body.mobile .gar-title { font-size: 9px; }
 body.mobile .gar-hint { font-size: 6px; }
+body.mobile .gar-stage { margin-top: 10px; }
+body.mobile .gar-nav-btn { width: 38px; height: 46px; font-size: 13px; }
+body.mobile #gar-prev { left: 5px; }
+body.mobile #gar-next { right: 5px; }
+body.mobile .gar-stage-info { font-size: 7px; gap: 7px; margin-top: 6px; }
+body.mobile .gar-stage-name { font-size: 9px; }
 body.mobile .mp-turn-row { max-width: 300px; padding: 8px 10px; }
 body.mobile .mp-turn-label { font-size: 6px; }
 @media (max-height: 420px) {
@@ -1328,6 +1604,9 @@ body.mobile .mp-turn-label { font-size: 6px; }
     #garage-preview { width: min(300px, 78vw); }
     .gar-row { min-height: 36px; }
     .gar-quick { margin-bottom: 8px; }
+    .gar-nav-btn { width: 34px; height: 42px; font-size: 12px; }
+    #gar-prev { left: 4px; }
+    #gar-next { right: 4px; }
     .mp-turn-row { margin-bottom: 6px; padding: 7px 10px; }
 }
 
@@ -1488,14 +1767,9 @@ body.mobile .result-series { font-size: 8px; }
     transition: border-color 0.15s, box-shadow 0.15s;
 }
 .pf-avatar:hover { border-color: #ff9800; box-shadow: 0 0 0 1px #ff9800; }
-.pf-id-block { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1; }
-.pf-stats {
-    font-size: 8px;
-    color: #4fc3f7;
-    letter-spacing: 1px;
-    line-height: 1.8;
-    text-shadow: 1px 1px 0 #000;
-}
+/* (.pf-stats removed — the identity card no longer carries W/L/races;
+   that data lives in the CAREER screen.) */
+.pf-id-block { display: flex; flex-direction: column; justify-content: center; gap: 8px; min-width: 0; flex: 1; }
 .pf-id-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .pf-id-label { font-size: 7px; color: #9aa0aa; letter-spacing: 1px; flex: 0 0 auto; }
 .pf-id {
@@ -1570,38 +1844,61 @@ body.mobile .result-series { font-size: 8px; }
 .fr-list {
     width: 100%;
     max-width: 360px;
-    max-height: 24vh;
-    min-height: 0;
+    max-height: 26vh;
+    min-height: 138px;
     overflow-y: auto;
     overscroll-behavior: contain;
     display: flex; flex-direction: column; gap: 6px;
     scrollbar-width: thin; scrollbar-color: #3a3f4a #0a0a0a;
     flex: 0 1 auto;
+    align-self: center;
+    width: 100%;
 }
 .fr-list::-webkit-scrollbar { width: 6px; }
 .fr-list::-webkit-scrollbar-thumb { background: #3a3f4a; border-radius: 3px; }
 .fr-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 9px;
     background: #0a0a0a;
     border: 1px solid #2c2f38;
-    padding: 7px 9px;
-    font-size: 8px;
+    padding: 7px 10px;
+    font-size: 9px;
     flex: 0 0 auto;
-    min-height: 36px;
+    min-height: 44px;
 }
 .fr-row:hover { border-color: #3d414c; }
 .fr-empty { color: #5a6070; letter-spacing: 1px; justify-content: center; }
 .fr-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #eceff1; }
-.fr-sub { color: #5a6070; font-size: 7px; letter-spacing: 1px; flex: 0 0 auto; }
+.fr-sub { color: #5a6070; font-size: 7px; letter-spacing: 1px; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fr-sub-on { color: #69f0ae; }
-.fr-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: 0 0 8px; }
+.fr-dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex: 0 0 9px; }
 .fr-dot.on { background: #4caf50; box-shadow: 0 0 6px rgba(76,175,80,0.8); }
+/* Friend-row avatar slot: pfp when the live profile mirror has one, a
+   colored initial tile otherwise. Same square/cover contract as every
+   other avatar surface (menu chip, profile panel, MP lobby). */
+.fr-av {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    flex: 0 0 34px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    color: #eceff1;
+    background: #37474f;
+    border: 1px solid #455a64;
+}
+.fr-av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.fr-row-blocked .fr-av { filter: grayscale(1) brightness(0.6); border-color: #3a2f1d; }
 .fr-btn {
     font-family: 'Press Start 2P', cursive;
-    font-size: 7px;
-    padding: 6px 8px;
+    font-size: 8px;
+    padding: 8px 10px;
+    min-height: 28px;
     background: #1c222b;
     border: 1px solid #455a64;
     color: #cfd8dc;
@@ -1634,9 +1931,10 @@ body.mobile .result-series { font-size: 8px; }
 
 body.mobile .pf-panel { padding: 12px 12px 12px; }
 body.mobile .pf-section-label { font-size: 7px; margin: 8px 0 4px; }
-body.mobile .fr-row { font-size: 7px; padding: 6px 7px; min-height: 34px; }
-body.mobile .fr-btn { font-size: 6px; padding: 5px 6px; }
-body.mobile .fr-sub { font-size: 6px; }
+body.mobile .fr-row { font-size: 8px; padding: 7px 9px; min-height: 44px; }
+body.mobile .fr-av { width: 30px; height: 30px; flex-basis: 30px; font-size: 12px; border-radius: 7px; }
+body.mobile .fr-btn { font-size: 7px; padding: 8px 9px; min-height: 28px; }
+body.mobile .fr-sub { font-size: 7px; }
 body.mobile .fr-list { max-height: 22vh; }
 body.mobile .pf-link-btn { font-size: 7px; padding: 10px 4px; }
 body.mobile .pf-avatar { width: 64px; height: 64px; flex-basis: 64px; font-size: 22px; }
@@ -1696,6 +1994,16 @@ body.mobile .pf-stats { font-size: 7px; }
     pointer-events: none;
 }
 .menu-record:empty { display: none; }
+/* Narrow NON-touch desktop windows (< ~720px): the centered title band can
+   reach the top-left chip zone. Real phones are excluded (pointer: coarse —
+   their rotated stages never overlap); the grid/height tiers are untouched —
+   only this chip relocates, dropping under SETTINGS corner's left edge. */
+@media (max-width: 719px) and (pointer: fine) and (hover: hover) {
+    .menu-record {
+        top: auto;
+        bottom: calc(max(14px, env(safe-area-inset-bottom)) + 44px);
+    }
+}
 
 /* Tall desktops: center the main menu and results vertically — top-hugging
    columns left a dead half-screen below (mobile keeps its compacted
@@ -1707,7 +2015,6 @@ body:not(.mobile) #results-menu { justify-content: center; }
     flex: 0 0 auto;
     background: #08090b;
     border: 1px solid #22262e;
-    image-rendering: pixelated;
     width: 150px;
     height: 46px;
 }
@@ -1731,3 +2038,825 @@ body.mobile .mp-car-preview { width: 118px; height: 37px; }
     outline: 2px solid #ffeb3b;
     outline-offset: 2px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   CAREER LEDGER & ACHIEVEMENTS (career.js)
+   Trophy-gold accent (#ffd54f family) — the board reads as its own
+   reward layer, distinct from cash-green and race-red. Panel language
+   mirrors .pf-panel; the corner control mirrors .menu-settings-btn
+   (the main menu grid's rhythm is tuned for exactly 8 buttons —
+   see the media-query comments above — so career is a corner chip).
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Corner control — bottom-left twin of SETTINGS. */
+.career-menu-btn {
+    position: absolute;
+    bottom: max(14px, env(safe-area-inset-bottom));
+    left: max(18px, env(safe-area-inset-left));
+    font-size: 8px;
+    letter-spacing: 1px;
+    color: #ffe082;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid #5d4d1f;
+    padding: 8px 10px;
+    cursor: pointer;
+    user-select: none; -webkit-user-select: none;
+    text-transform: uppercase;
+    font-family: 'Press Start 2P', cursive;
+    transition: border-color 0.15s, color 0.15s, transform 0.1s;
+}
+.career-menu-btn:hover {
+    border-color: #ffd54f;
+    color: #fff8e1;
+    background: rgba(30, 24, 4, 0.75);
+}
+.career-menu-btn:active { transform: translateY(1px); }
+.career-menu-btn:focus-visible {
+    outline: 2px solid #ffeb3b;
+    outline-offset: 2px;
+}
+.career-btn-trophy {
+    color: #ffd54f;
+    margin-right: 4px;
+    /* Soft idle gleam — one pulse every 3s, disabled for reduced motion. */
+    animation: career-gleam 3s ease-in-out infinite;
+}
+@keyframes career-gleam {
+    0%, 72%, 100% { text-shadow: 0 0 0 rgba(255, 213, 79, 0); }
+    82% { text-shadow: 0 0 8px rgba(255, 213, 79, 0.85); }
+}
+.career-btn-count { color: #8d8d8d; }
+/* Gold flash on the corner chip when an achievement unlocks (career.js adds
+   .unlock-pulse for ~1.8s, mirroring the ACHIEVEMENT toast). */
+.career-menu-btn.unlock-pulse { animation: career-unlock 0.8s ease-out 2; }
+@keyframes career-unlock {
+    0%   { border-color: #5d4d1f; color: #ffe082; }
+    40%  { border-color: #ffeb3b; color: #ffffff; background: rgba(60, 48, 6, 0.85); box-shadow: 0 0 12px rgba(255, 213, 79, 0.5); }
+    100% { border-color: #5d4d1f; color: #ffe082; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .career-btn-trophy { animation: none; }
+    .career-menu-btn { transition: none; }
+    .career-menu-btn.unlock-pulse { animation: none; }
+}
+body.mobile .career-menu-btn { font-size: 7px; padding: 7px 8px; }
+body.mobile.portrait .career-menu-btn {
+    bottom: max(10px, env(safe-area-inset-bottom));
+    left: max(12px, env(safe-area-inset-left));
+    padding: 6px 7px;
+}
+
+/* Ledger panel — same steel/glass language as the profile panel. */
+.career-panel {
+    width: min(480px, 94vw);
+    max-height: 100%;
+    min-height: 0;
+    flex: 0 1 auto;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: #3a3f4a #0d0e12;
+    background: linear-gradient(180deg, #14161b 0%, #0d0e12 100%);
+    border: 2px solid #2c2f38;
+    box-shadow: 0 0 0 4px #050505, 8px 8px 0 rgba(0,0,0,0.65), inset 0 1px 0 rgba(255,255,255,0.04);
+    padding: 16px 18px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+}
+/* Gold top-edge thread tying the panel to its trophy accent. */
+.career-panel::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent 0%, #8d6e1f 18%, #ffd54f 50%, #8d6e1f 82%, transparent 100%);
+    pointer-events: none;
+}
+
+/* Driver level bar (Task 18) — the career panel's opener block. Gold
+   Trophy-accent family (#ffd54f) matches the panel's top edge gradient so
+   the level reads as the panel's headline. Level text is set by JS via
+   textContent-free innerHTML built only from internal numbers (no remote
+   data), and aria progressbar semantics live on the track element. */
+.career-xp {
+    width: 100%;
+    margin-bottom: 12px;
+    padding: 8px 10px 9px;
+    background: linear-gradient(180deg, #1a1c22 0%, #14161b 100%);
+    border: 1px solid #2e3138;
+    border-radius: 6px;
+    box-shadow: inset 0 1px 0 rgba(255, 213, 79, 0.06);
+}
+.career-xp-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 3px 10px;
+    margin-bottom: 6px;
+}
+.career-xp-lvl {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    color: #ffd54f;
+    text-shadow: 0 0 8px rgba(255, 213, 79, 0.25);
+    white-space: nowrap;
+}
+.career-xp-note {
+    font-size: 7px;
+    letter-spacing: 0.8px;
+    color: #8b8f98;
+    white-space: nowrap;
+    text-align: right;
+}
+.career-xp-track {
+    position: relative;
+    height: 8px;
+    background: #0d0e12;
+    border: 1px solid #262a32;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.career-xp-track i {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, #8d6e1f 0%, #ffd54f 60%, #ffe28a 100%);
+    border-radius: 3px;
+    box-shadow: 0 0 6px rgba(255, 213, 79, 0.35);
+    transition: width 500ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Lifetime stat ledger — 2-column grid of label/value rows. */
+.career-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+    width: 100%;
+    margin-bottom: 14px;
+}
+.career-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    background: #191b20;
+    border: 1px solid #262a32;
+    padding: 7px 9px;
+    font-size: 7px;
+    color: #9e9e9e;
+    letter-spacing: 0.5px;
+    min-width: 0;
+}
+.career-stat b {
+    color: #ffeb3b;
+    font-size: 8px;
+    text-shadow: 1px 1px 0 #000;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Achievements header row. */
+.career-ach-head-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    width: 100%;
+    border-top: 1px solid #262a32;
+    padding-top: 10px;
+}
+.career-section-label {
+    font-size: 8px;
+    color: #bdbdbd;
+    letter-spacing: 1px;
+}
+.career-ach-count {
+    font-size: 8px;
+    color: #ffd54f;
+    text-shadow: 1px 1px 0 #000;
+}
+
+/* Achievement cards — locked cards sit dim; unlocked cards carry the gold. */
+.career-ach-list {
+    width: 100%;
+    margin-top: 8px;
+    padding-right: 2px;
+}
+.career-ach {
+    width: 100%;
+    border: 1px solid #262a32;
+    background: #14161b;
+    padding: 9px 11px;
+    margin-bottom: 7px;
+    flex: 0 0 auto;
+}
+.career-ach.got {
+    border-color: #8d6e1f;
+    background: linear-gradient(180deg, #1d1a0e 0%, #15120a 100%);
+    box-shadow: inset 3px 0 0 #ffd54f;
+}
+.career-ach-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+}
+.career-ach-name {
+    font-size: 9px;
+    color: #e0e0e0;
+    letter-spacing: 0.5px;
+}
+.career-ach.got .career-ach-name { color: #ffeb3b; }
+.career-ach-state {
+    font-size: 7px;
+    color: #ffd54f;
+    letter-spacing: 1px;
+    white-space: nowrap;
+}
+.career-ach-desc {
+    font-size: 7px;
+    color: #9e9e9e;
+    margin-top: 5px;
+    line-height: 1.6;
+}
+.career-ach.got .career-ach-desc { color: #a8945c; }
+
+/* Progress bars — gold fill on a dark rail, width set inline by career.js. */
+.career-ach-bar {
+    height: 6px;
+    background: #0a0b0d;
+    border: 1px solid #262a32;
+    margin-top: 7px;
+    overflow: hidden;
+}
+.career-ach-bar i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #b8860b, #ffd54f);
+    transition: width 0.4s ease-out;
+}
+.career-ach-prog {
+    font-size: 7px;
+    color: #757575;
+    margin-top: 4px;
+}
+@media (prefers-reduced-motion: reduce) {
+    .career-ach-bar i { transition: none; }
+}
+
+/* ── TODAY strip — local-day snapshot under the stat grid. ────────── */
+.career-today {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    box-sizing: border-box;
+    background: #12140a;
+    border: 1px solid #3a3a22;
+    box-shadow: inset 3px 0 0 #ffd54f;
+    padding: 7px 10px;
+    margin-bottom: 12px;
+    animation: career-fade-in 0.25s ease-out;
+}
+.career-today[hidden] { display: none; }
+.career-today-label {
+    font-size: 7px;
+    color: #ffd54f;
+    letter-spacing: 1px;
+    margin-right: auto;
+}
+.career-today b {
+    font-size: 7px;
+    color: #bdbdbd;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+.career-today b.good { color: #66bb6a; }
+@keyframes career-fade-in {
+    from { opacity: 0; transform: translateY(-3px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .career-today { animation: none; }
+}
+
+/* ── ET progression sparkline (career.js draws on the canvas). ────── */
+.career-spark-wrap {
+    width: 100%;
+    margin-bottom: 12px;
+}
+.career-spark-wrap[hidden] { display: none; }
+.career-spark-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 4px 10px;
+    margin-bottom: 5px;
+    /* ≤390px the note can't fit beside the label — wrap it UNDER instead
+       of letting the two collide (pre-existing overlap, fixed). */
+    flex-wrap: wrap;
+}
+.career-spark-note {
+    font-size: 6px;
+    color: #757575;
+    letter-spacing: 0.5px;
+    text-align: right;
+    min-width: 0;
+    white-space: nowrap;
+}
+.career-spark {
+    display: block;
+    width: 100%;
+    height: 64px;
+    background: linear-gradient(180deg, #101216 0%, #0a0b0d 100%);
+    border: 1px solid #262a32;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+/* Ghost verdict chip (neutral) + NEW GHOST RECORD (gold) — wired by
+   game.js for replay races only; hidden markup everywhere else. */
+.results-ghost-badge {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: #9e9e9e;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(158, 158, 158, 0.35);
+    padding: 3px 10px;
+    margin: 8px auto 0;
+    width: fit-content;
+    text-shadow: 1px 1px 0 #000;
+    animation: resultBadgeIn 0.25s ease-out both;
+}
+.results-ghost-badge.results-ghost-record {
+    color: #ffd54f;
+    border-color: rgba(255, 213, 79, 0.45);
+    background: rgba(255, 213, 79, 0.07);
+}
+.results-ghost-badge[hidden] { display: none; }
+@media (prefers-reduced-motion: reduce) {
+    .results-ghost-badge { animation: none; }
+}
+
+/* ── RACE LEDGER — W/L receipt rows with mode chips, rival handle,
+   persona tier, ET + PB, signed margin, prize and time-ago. The list
+   itself scrolls (capped height + thin custom scrollbar) so up to 100
+   kept races never stretch the career panel. ───────────────────────── */
+.career-history {
+    width: 100%;
+    margin-bottom: 4px;
+    max-height: 232px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* The panel is a flex column — without this a scroll container's
+       automatic minimum size is ZERO and the whole list collapses when
+       the panel content runs tall (the 1-row case collapsed too). */
+    flex: 0 0 auto;
+    scrollbar-width: thin;
+    scrollbar-color: #3a3f4a #0d0e12;
+    padding-right: 2px;
+}
+.career-history::-webkit-scrollbar { width: 8px; }
+.career-history::-webkit-scrollbar-track { background: #0d0e12; border-radius: 4px; }
+.career-history::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #3a3f4a, #262a32);
+    border-radius: 4px;
+    border: 1px solid #0d0e12;
+}
+.career-history::-webkit-scrollbar-thumb:hover { background: #4a5060; }
+.career-hrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    background: #14161b;
+    border: 1px solid #262a32;
+    padding: 6px 9px;
+    margin-bottom: 4px;
+    transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}
+.career-hrow:hover {
+    border-color: #3a3f4a;
+    background: #191b20;
+    transform: translateX(2px);
+}
+@media (prefers-reduced-motion: reduce) {
+    .career-hrow { transition: none; }
+    .career-hrow:hover { transform: none; }
+}
+/* Result edge + W/L badge — green for the winner, dim red for the rest. */
+.career-hrow.win  { box-shadow: inset 3px 0 0 #43a047; }
+.career-hrow.loss { box-shadow: inset 3px 0 0 #5c3737; }
+.career-h-res {
+    font-size: 9px;
+    width: 14px;
+    text-align: center;
+    text-shadow: 1px 1px 0 #000;
+}
+.career-hrow.win  .career-h-res { color: #66bb6a; }
+.career-hrow.loss .career-h-res { color: #b0575a; }
+/* Mode chips — each mirrors its menu button's accent: quick steel,
+   tournament red, ghost cyan (GHOST RACE), P2P orange (MULTIPLAYER). */
+.career-h-mode {
+    font-size: 6px;
+    letter-spacing: 1px;
+    padding: 2px 5px 1px;
+    border-radius: 2px;
+    white-space: nowrap;
+    text-shadow: none;
+}
+.career-h-mode.m-quick      { color: #b0bec5; background: #1c2026; border: 1px solid #37474f; }
+.career-h-mode.m-tournament { color: #ffcdd2; background: #2c1214; border: 1px solid #ef5350; }
+.career-h-mode.m-ghost      { color: #b3e5fc; background: #0e1c26; border: 1px solid #4fc3f7; }
+.career-h-mode.m-mp         { color: #fff3e0; background: #2a1a05; border: 1px solid #ff9800; }
+.career-h-et {
+    font-size: 8px;
+    color: #e0e0e0;
+    margin-left: auto;
+    white-space: nowrap;
+    text-shadow: 1px 1px 0 #000;
+}
+.career-h-et.pb { color: #ffeb3b; }
+.career-h-et.dq { color: #b0575a; }
+.career-h-pb {
+    font-size: 6px;
+    color: #1b1500;
+    background: #ffd54f;
+    border-radius: 2px;
+    padding: 2px 4px 1px;
+    letter-spacing: 1px;
+    font-weight: bold;
+    text-shadow: none;
+    animation: career-pb-pop 0.35s ease-out;
+}
+@keyframes career-pb-pop {
+    0% { transform: scale(0.6); opacity: 0; }
+    70% { transform: scale(1.15); }
+    100% { transform: scale(1); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .career-h-pb { animation: none; }
+}
+.career-h-ago {
+    font-size: 6px;
+    color: #757575;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    min-width: 52px;
+    text-align: right;
+}
+.career-h-empty {
+    font-size: 7px;
+    color: #616161;
+    letter-spacing: 1px;
+    text-align: center;
+    padding: 12px 0;
+    border: 1px dashed #262a32;
+}
+
+/* Tighter rhythm on small screens — same breakpoints the profile panel uses. */
+body.mobile .career-panel { padding: 12px 12px 10px; }
+body.mobile .career-stats { gap: 4px; }
+body.mobile .career-xp { margin-bottom: 10px; padding: 7px 8px 8px; }
+body.mobile .career-xp-lvl { font-size: 9px; }
+body.mobile .career-xp-track { height: 7px; }
+/* ≤390px: the XP note can't always fit beside the LVL chip — let the head
+   wrap so the note drops under the chip instead of clipping. */
+@media (max-width: 390px) {
+    .career-xp-head { flex-wrap: wrap; }
+    .career-xp-note { text-align: left; }
+}
+body.mobile .career-stat { padding: 6px 7px; }
+body.mobile .career-ach { padding: 8px 9px; }
+body.mobile .career-today { gap: 7px; padding: 6px 8px; }
+body.mobile .career-today b { font-size: 6px; }
+body.mobile .career-hrow { padding: 6px 7px; gap: 6px; }
+body.mobile .career-h-ago { min-width: 44px; }
+body.mobile.portrait .career-panel { width: min(480px, 96vw); }
+
+/* Keyboard operability (role=button divs). */
+.career-menu-btn:focus-visible {
+    outline: 2px solid #ffeb3b;
+    outline-offset: 2px;
+}
+#career-menu [role="button"]:focus-visible {
+    outline: 2px solid #ffeb3b;
+    outline-offset: 2px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   DAILY LOGIN BONUS (daily.js) — slim claim strip under the CASH box,
+   mirroring the left chip stack (BEST ET / verify pill). Gold accent to
+   match the career ledger; green claim mirrors the menu's confirm color.
+   Static by design — no idle animation, reduced-motion safe.
+   ══════════════════════════════════════════════════════════════════════ */
+.daily-bonus {
+    position: absolute;
+    top: calc(max(15px, env(safe-area-inset-top)) + 56px);
+    right: max(20px, env(safe-area-inset-right));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.78);
+    border: 1px solid #8d6e2f;
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.55);
+    padding: 5px 6px 5px 10px;
+    font-family: 'Press Start 2P', cursive;
+    z-index: 6;
+    animation: daily-in 0.18s ease-out both;
+}
+.daily-bonus[hidden] { display: none; }
+@keyframes daily-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.daily-streak {
+    font-size: 7px;
+    letter-spacing: 1px;
+    color: #ffd54f;
+    white-space: nowrap;
+    user-select: none; -webkit-user-select: none;
+}
+.daily-pips { display: inline-flex; gap: 3px; flex: 0 0 auto; }
+.daily-pips i {
+    width: 5px; height: 5px;
+    background: #26221a;
+    border: 1px solid #4a3f22;
+}
+.daily-pips i.on {
+    background: #ffd54f;
+    border-color: #fff176;
+    box-shadow: 0 0 4px rgba(255, 213, 79, 0.45);
+}
+.daily-amount {
+    font-size: 9px;
+    letter-spacing: 1px;
+    color: #69f0ae;
+    white-space: nowrap;
+    user-select: none; -webkit-user-select: none;
+}
+.daily-claim {
+    font-family: 'Press Start 2P', cursive;
+    font-size: 7px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 7px 9px;
+    background: #2e7d32;
+    border: 1px solid #66bb6a;
+    color: #fff;
+    cursor: pointer;
+    box-shadow: 2px 2px 0 #000;
+    text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.4);
+    user-select: none; -webkit-user-select: none;
+    transition: background 0.12s, transform 0.05s, box-shadow 0.05s;
+}
+.daily-claim:hover  { background: #388e3c; }
+.daily-claim:active { transform: translate(2px, 2px); box-shadow: 0 0 0 #000; }
+.daily-claim:focus-visible { outline: 2px dashed #ffeb3b; outline-offset: 2px; }
+
+/* Narrow NON-touch desktop windows: follow the BEST ET chip relocation
+   tier so the left-bottom corner stays the chip zone on that class. */
+@media (max-width: 719px) and (pointer: fine) and (hover: hover) {
+    .daily-bonus {
+        top: auto;
+        bottom: calc(max(14px, env(safe-area-inset-bottom)) + 44px);
+        right: max(14px, env(safe-area-inset-right));
+    }
+}
+
+/* Phones (the stage renders rotated): tighten the strip so it never
+   crowds the CASH box row. */
+body.mobile .daily-bonus { gap: 6px; padding: 4px 5px 4px 8px; }
+body.mobile .daily-claim { padding: 6px 8px; }
+body.mobile .daily-amount { font-size: 8px; }
+
+/* Narrow non-rotated stages (<=420px): the CASH readout relocates to
+   safe+92px in this band — stack the strip beneath it (the +56px desktop
+   spot would hit the title). The rotated portrait stage is excluded on
+   purpose: it rotates as one rigid frame, so its stage-coordinate layout
+   already matches desktop geometry. */
+@media (max-width: 420px) {
+    body:not(.mobile.portrait) .daily-bonus {
+        top: calc(max(15px, env(safe-area-inset-top)) + 138px);
+    }
+}
+/* Narrow AND short (small phones pre-rotation, tiny preview panes):
+   compact variant — pips dropped, tighter paddings — so the strip fits
+   the sliver between the CASH readout and the menu grid. */
+@media (max-width: 420px) and (max-height: 640px) {
+    body:not(.mobile.portrait) .daily-bonus {
+        top: calc(max(15px, env(safe-area-inset-top)) + 122px);
+        padding: 2px 4px 2px 7px;
+        gap: 5px;
+    }
+    body:not(.mobile.portrait) .daily-pips { display: none; }
+    body:not(.mobile.portrait) .daily-claim { padding: 4px 6px; }
+    body:not(.mobile.portrait) .daily-amount { font-size: 7px; }
+    body:not(.mobile.portrait) .daily-streak { font-size: 6px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .daily-bonus { animation: none; }
+    .daily-claim { transition: none; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   RACE LEDGER v2 (career.js) — filter chips + form strip + receipt rows
+   with rival handle, persona tier, signed margin and prize. The rows
+   read like a drag-strip timeslip log: newest first, staggered reveal,
+   W/L edge bars kept from v1.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Filter chips + last-5 form dots — sits between the RACE LEDGER label
+   and the scroll list. Chips are real buttons (keyboard reachable). */
+.career-ledger-top {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 2px 0 6px;
+}
+.career-ledger-chips {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.career-ledger-chip {
+    font-family: inherit;
+    font-size: 7px;
+    letter-spacing: 1px;
+    color: #9e9e9e;
+    background: #14161b;
+    border: 1px solid #262a32;
+    border-radius: 2px;
+    padding: 4px 7px 3px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s, transform 0.1s;
+    text-shadow: none;
+}
+.career-ledger-chip i {
+    font-style: normal;
+    font-size: 6.5px;
+    color: #616161;
+    margin-left: 2px;
+}
+.career-ledger-chip:hover { border-color: #3a3f4a; color: #e0e0e0; transform: translateY(-1px); }
+.career-ledger-chip:active { transform: translateY(0); }
+.career-ledger-chip.on {
+    color: #1b1500;
+    background: #ffd54f;
+    border-color: #ffd54f;
+    font-weight: bold;
+}
+.career-ledger-chip.on i { color: #6d5a10; }
+.career-ledger-chip:focus-visible {
+    outline: 2px solid #ffeb3b;
+    outline-offset: 2px;
+}
+/* Form strip — 5 dots, oldest to newest: green win, dim red loss,
+   red-slash DQ. Empty slot placeholder keeps the strip steady. */
+.career-ledger-form {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.career-ledger-form span {
+    font-size: 6px;
+    letter-spacing: 1.5px;
+    color: #616161;
+    margin-right: 2px;
+}
+.career-form-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+.career-form-dot.w { background: #43a047; }
+.career-form-dot.l { background: #5c3737; }
+.career-form-dot.dq {
+    background: repeating-linear-gradient(45deg, #8e3b3b 0 2px, #5c3737 2px 4px);
+}
+
+/* Row reveal — a quiet slide-up as the panel opens. Delay is inline
+   (index-based, capped at 420ms) so it also works when a FILTER re-render
+   changes the row count. prefers-reduced-motion + html.reduce-motion both
+   strip it (kill switch at the bottom of this block). */
+.career-hrow {
+    animation: ledger-row-in 0.28s ease-out backwards;
+}
+@keyframes ledger-row-in {
+    from { opacity: 0; transform: translateY(5px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Rival line — handle (escaped at render) + persona tier badge. */
+.career-h-opp {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 7.5px;
+    color: #cfd8dc;
+    letter-spacing: 0.4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-shadow: 1px 1px 0 #000;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.career-h-tier {
+    flex: 0 0 auto;
+    font-size: 5.5px;
+    letter-spacing: 1px;
+    padding: 2px 4px 1px;
+    border-radius: 2px;
+    text-shadow: none;
+    border: 1px solid;
+}
+/* Persona tier colors — climb the ladder: rookie grey, street teal,
+   semi-pro amber, pro red. Mirrors the HUD persona accents. */
+.career-h-tier.t-rookie   { color: #b0bec5; background: #16191d; border-color: #455a64; }
+.career-h-tier.t-street   { color: #80cbc4; background: #0e1a18; border-color: #37474f; }
+.career-h-tier.t-semipro  { color: #ffcc80; background: #1d1508; border-color: #8d6e1f; }
+.career-h-tier.t-pro      { color: #ef9a9a; background: #230f0f; border-color: #c62828; }
+
+/* Signed margin — minus (green) = you got there first, plus (red) = the
+   rival beat you to the line. `none` keeps the column aligned when a
+   DNF/DQ row has no honest gap to print. */
+.career-h-gap {
+    font-size: 7.5px;
+    min-width: 52px;
+    text-align: right;
+    white-space: nowrap;
+    text-shadow: 1px 1px 0 #000;
+    font-variant-numeric: tabular-nums;
+}
+.career-h-gap.up { color: #66bb6a; }
+.career-h-gap.dn { color: #b0575a; }
+.career-h-gap.none { visibility: hidden; }
+
+/* Prize paid — gold-green like the results count-up; empty rows keep
+   the rhythm without ink. */
+.career-h-cash {
+    font-size: 7px;
+    color: #a5d6a7;
+    min-width: 34px;
+    text-align: right;
+    white-space: nowrap;
+    text-shadow: 1px 1px 0 #000;
+    font-variant-numeric: tabular-nums;
+}
+.career-h-cash.none { visibility: hidden; }
+
+/* PB runs get a faint gold wash + gold edge (double accent with the
+   inset W bar), DQ rows a dull red one. */
+.career-hrow.is-pb {
+    background: linear-gradient(90deg, rgba(255, 213, 79, 0.07), rgba(255, 213, 79, 0.015) 60%, transparent);
+    border-color: #6d5a10;
+}
+.career-hrow.dq { border-color: #4a2424; }
+
+/* ET cell no longer needs margin-left:auto (the opp line flexes now) —
+   keep right alignment via the gap/cash columns. */
+.career-h-et { margin-left: 0; min-width: 52px; text-align: right; }
+
+/* Narrow viewports: the receipt wraps into two tiers — result, mode and
+   rival on top; ET, PB, gap, prize and age tucked under. Dots/scroll
+   stay identical. */
+@media (max-width: 480px) {
+    .career-ledger-top { gap: 6px; }
+    .career-ledger-chip { padding: 4px 6px 3px; font-size: 6.5px; }
+    .career-history { max-height: 200px; }
+    .career-hrow { flex-wrap: wrap; row-gap: 3px; }
+    .career-h-opp { flex-basis: calc(100% - 132px); }
+    .career-h-et, .career-h-gap, .career-h-cash { min-width: 0; }
+    .career-h-ago { margin-left: auto; min-width: 44px; }
+}
+@media (max-width: 360px) {
+    .career-h-opp { flex-basis: calc(100% - 118px); }
+    .career-ledger-form { display: none; }
+}
+
+/* Reduced-motion kill switches — BOTH the OS setting and the in-game
+   REDUCE FX toggle. */
+@media (prefers-reduced-motion: reduce) {
+    .career-hrow { animation: none; }
+    .career-ledger-chip { transition: none; }
+    .career-ledger-chip:hover { transform: none; }
+}
+html.reduce-motion *,
+html.reduce-motion *::before,
+html.reduce-motion *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+}
+html.reduce-motion .career-hrow { animation: none; }

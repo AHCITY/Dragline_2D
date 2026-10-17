@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<!--
+  _garcheck.html - proves the garage preview is no longer blurry.
+
+  Reproduces the exact sizing math from game.js _sizeGaragePreview() +
+  _drawGaragePreview() against the real car-art.js / renderer.js, and renders
+  it at the two backing-store sizes side by side:
+
+    LEFT  340x120 backing, CSS-stretched   <- what the game used to do
+    RIGHT device-resolution backing        <- what it does now
+
+  Run Chrome with --force-device-scale-factor=2 to see the real difference.
+
+  Not shipped. Nothing in index.html references this file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>garage sharpness check</title>
+<style>
+  body { margin:0; background:#0a0b0d; color:#e8eaed;
+         font:12px "Press Start 2P", monospace; }
+  .row { display:flex; gap:16px; padding:16px; align-items:flex-start; }
+  figure { margin:0; }
+  figcaption { padding-top:8px; color:#8b949e; }
+  /* Same rule the garage preview actually gets in the game. */
+  #old, #new {
+    display:block;
+    border:2px solid #2c2f38;
+    background: radial-gradient(circle at 50% 30%, rgba(255,255,255,.06), transparent 60%), #08090b;
+    max-width:100%;
+    height:auto;
+  }
+</style>
+</head>
+<body>
+<div class="row">
+  <figure>
+    <canvas id="old"></canvas>
+    <figcaption>OLD: fixed 340x120 store, CSS-stretched</figcaption>
+  </figure>
+  <figure>
+    <canvas id="new"></canvas>
+    <figcaption>NEW: store sized from layout x DPR</figcaption>
+  </figure>
+</div>
+
+<script src="../car-art.js"></script>
+<script src="../renderer.js"></script>
+<script>
+'use strict';
+function artAnchor(car, key) { return car._artAnchors?.[key] || { x: 3, y: 27, w: 14 }; }
+
+const car = {
+  art: 's14', type: 'modern', name: 'S14', color: '#9aa6b2', secondaryColor: '#c8452e',
+  wheelRotation: 0, speed: 0, squat: 0,
+  upgrades: { engine: 0, slicks: false, parachute: false },
+  customization: {
+    tire: { id: 'street', name: 'street', scale: 1.00, rimRadius: 0.68 },
+    tireBrand: { brand: 'BRIDGESTONE' },
+    rim: { id: 'five_spoke', draw: (c, r) => CarArt.drawRimFace(c, r, 'five_spoke') },
+    rimPaint: { id: 'stock' }, tint: { id: 'stock' },
+    livery: null, spoiler: null, bodyKit: null, exhaust: null,
+  },
+};
+
+/* Mirrors _drawGaragePreview(): fit the 104x44 art box to the canvas. */
+function paint(canvas, glowRadius) {
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  const CW = canvas.width, CH = canvas.height;
+  ctx.clearRect(0, 0, CW, CH);
+  const g = ctx.createRadialGradient(CW / 2, CH * .62, 8, CW / 2, CH * .62, glowRadius);
+  g.addColorStop(0, 'rgba(255,255,255,0.10)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, CW, CH);
+  const scale = Math.min((CW - 16) / 104, (CH - 14) / 44);
+  ctx.save();
+  ctx.translate((CW - 104 * scale) / 2, CH - 44 * scale - 6);
+  ctx.scale(scale, scale);
+  Renderer.drawCar(ctx, car, 0, 0);
+  ctx.restore();
+}
+
+const CSS_W = 300, CSS_H = Math.round(300 * 120 / 340);   // the element's layout size
+
+/* OLD path: fixed 340x120 backing store, element sized by CSS to 300px wide. */
+const old = document.getElementById('old');
+old.width = 340; old.height = 120;
+old.style.width = CSS_W + 'px'; old.style.height = CSS_H + 'px';
+paint(old, 170);
+
+/* NEW path: backing store = laid-out box * DPR, exactly as game.js does. */
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+const nw = document.getElementById('new');
+nw.style.width = CSS_W + 'px'; nw.style.height = CSS_H + 'px';
+nw.width = Math.round(CSS_W * dpr);
+nw.height = Math.round(CSS_H * dpr);
+paint(nw, nw.height * 1.4);
+
+document.title = 'dpr=' + dpr + ' oldStore=' + old.width + 'x' + old.height +
+                 ' newStore=' + nw.width + 'x' + nw.height;
+</script>
+</body>
+</html>

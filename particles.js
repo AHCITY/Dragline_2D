@@ -1,5 +1,12 @@
 'use strict';
 
+/* Hoisted per-frame constants: the smoke lobes used to be two fresh
+ * array literals PLUS a slice() allocation for every smoke particle
+ * drawn, every frame — pure GC fodder on the hottest draw path. */
+const SMOKE_LOBES = [[-0.55, 0.12, 0.55], [-0.28, -0.25, 0.65], [0.06, -0.33, 0.68], [0.38, -0.11, 0.6], [0.52, 0.22, 0.48], [0, 0.22, 0.72]];
+const SMOKE_LOBES_SIMPLE = [[0, 0.22, 0.72], [0.06, -0.33, 0.68], [-0.28, -0.25, 0.65]];
+const MAX_PARTICLES = 260;   // hard safety cap — spawns above it are dropped
+
 class RaceParticles {
     constructor(ctx) {
         if (!ctx) throw new Error('RaceParticles needs a CanvasRenderingContext2D.');
@@ -9,6 +16,11 @@ class RaceParticles {
         this.boostOrigin = null;
         this.gearOrigin = null;
         this.time = 0;
+        this.fxLevel = 0;        // 0 full … 3 minimal (set by game.fxLevel)
+        this.rateMult = 1;
+        this.simpleSmoke = false;
+        this._glowSprite = null;  // cached spray-glow sprite (kills shadowBlur)
+        this._puffSprite = null;  // cached gear-smoke sprite (kills per-particle gradients)
     }
 
     static clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
@@ -18,7 +30,45 @@ class RaceParticles {
         return t * t * (3 - 2 * t);
     }
 
+    /* fxLevel: 0 = High FX (everything), 1-3 = progressively lighter.
+     * Only OPTIONAL intensity is reduced — no gameplay-relevant effect
+     * (gear flames stay readable, tire smoke still reads as smoke). */
+    setFxLevel(level) {
+        this.fxLevel = level | 0;
+        this.rateMult = [1, 0.6, 0.4, 0.25][this.fxLevel] || 1;
+        this.simpleSmoke = this.fxLevel >= 2;
+    }
+
+    /* Soft radial sprites rendered ONCE and blitted with drawImage —
+     * the same look as shadowBlur / per-particle gradients at a tiny
+     * fraction of the raster cost. */
+    _glow() {
+        if (this._glowSprite) return this._glowSprite;
+        const c = document.createElement('canvas'); c.width = 32; c.height = 32;
+        const g = c.getContext('2d');
+        const grad = g.createRadialGradient(16, 16, 1, 16, 16, 15);
+        grad.addColorStop(0, 'rgba(223,247,255,0.95)');
+        grad.addColorStop(0.45, 'rgba(125,211,252,0.5)');
+        grad.addColorStop(1, 'rgba(125,211,252,0)');
+        g.fillStyle = grad; g.fillRect(0, 0, 32, 32);
+        this._glowSprite = c;
+        return c;
+    }
+    _puff() {
+        if (this._puffSprite) return this._puffSprite;
+        const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+        const g = c.getContext('2d');
+        const grad = g.createRadialGradient(28, 24, 2, 32, 32, 30);
+        grad.addColorStop(0, 'rgba(255,220,150,.55)');
+        grad.addColorStop(0.4, 'rgba(140,85,50,.30)');
+        grad.addColorStop(1, 'rgba(60,40,35,0)');
+        g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+        this._puffSprite = c;
+        return c;
+    }
+
     _spawn(type, x, y, options = {}) {
+        if (this.particles.length >= MAX_PARTICLES) return;
         const random = RaceParticles.random;
         const defaultLife = type === 'boostFlame' ? random(.16, .28) : random(.5, .85);
         this.particles.push({
@@ -30,7 +80,7 @@ class RaceParticles {
 
     emitTireSmoke(rearWheelX, rearWheelY, burnout = false) {
         const rate = burnout ? 24 : 14;
-        if (Math.random() > rate / 120) return;
+        if (Math.random() > (rate * this.rateMult) / 120) return;
         const force = burnout ? 1.05 : .72;
         const baseSize = RaceParticles.random(8, 13);
         this._spawn('smoke', rearWheelX + RaceParticles.random(-2, 4), rearWheelY + RaceParticles.random(-4, 4), {
@@ -63,13 +113,13 @@ class RaceParticles {
         dt = Math.min(.033, Math.max(0, dt));
         this.time += dt;
 
-        if (this.boostOrigin && Math.random() < dt * 42) {
+        if (this.boostOrigin && Math.random() < dt * 42 * this.rateMult) {
             this._spawn('boostFlame', this.boostOrigin.x, this.boostOrigin.y, {
                 vx: RaceParticles.random(-28, -10), vy: RaceParticles.random(-7, 7), size: RaceParticles.random(12, 18)
             });
         }
         if (this.gearBurst > 0 && this.gearOrigin) {
-            if (Math.random() < dt * (20 + 18 * this.gearBurst)) {
+            if (Math.random() < dt * (20 + 18 * this.gearBurst) * this.rateMult) {
                 this._spawn('gearFlame', this.gearOrigin.x + RaceParticles.random(-2, 3), this.gearOrigin.y + RaceParticles.random(-4, 4), {
                     vx: RaceParticles.random(-110, -65), vy: RaceParticles.random(-15, 15),
                     life: RaceParticles.random(.22, .38), size: RaceParticles.random(7, 11)
@@ -109,19 +159,26 @@ class RaceParticles {
         ctx.save();
 
         if (p.type === 'smoke') {
-            const lobes = [[-.55,.12,.55],[-.28,-.25,.65],[.06,-.33,.68],[.38,-.11,.60],[.52,.22,.48],[0,.22,.72]];
-            ctx.globalAlpha = .38 * alpha; ctx.fillStyle = '#d0d8e0';
-            for (const [x, y, scale] of lobes) { ctx.beginPath(); ctx.arc(p.x + x * s, p.y + y * s, s * scale, 0, Math.PI * 2); ctx.fill(); }
-            ctx.globalAlpha = .44 * alpha; ctx.fillStyle = '#f0f4f8';
-            for (const [x, y, scale] of lobes.slice(1)) { ctx.beginPath(); ctx.arc(p.x + x * s * .9, p.y + y * s * .9 - 2, s * scale * .78, 0, Math.PI * 2); ctx.fill(); }
+            const lobes = this.simpleSmoke ? SMOKE_LOBES_SIMPLE : SMOKE_LOBES;
+            ctx.fillStyle = '#d0d8e0';
+            ctx.globalAlpha = .38 * alpha;
+            for (let i = 0; i < lobes.length; i++) { const L = lobes[i]; ctx.beginPath(); ctx.arc(p.x + L[0] * s, p.y + L[1] * s, s * L[2], 0, Math.PI * 2); ctx.fill(); }
+            if (!this.simpleSmoke) {   // highlight pass — same shape, no slice() copy
+                ctx.globalAlpha = .44 * alpha; ctx.fillStyle = '#f0f4f8';
+                for (let i = 1; i < SMOKE_LOBES.length; i++) { const L = SMOKE_LOBES[i]; ctx.beginPath(); ctx.arc(p.x + L[0] * s * .9, p.y + L[1] * s * .9 - 2, s * L[2] * .78, 0, Math.PI * 2); ctx.fill(); }
+            }
             ctx.globalAlpha = .08 * alpha; ctx.fillStyle = '#8a9aaa'; ctx.beginPath(); ctx.ellipse(p.x, p.y + s * .38, s * .68, s * .16, 0, 0, Math.PI * 2); ctx.fill();
         } else if (p.type === 'spray') {
-            ctx.globalAlpha = alpha; ctx.fillStyle = '#dff7ff'; ctx.shadowColor = '#7dd3fc'; ctx.shadowBlur = 4;
-            ctx.beginPath(); ctx.ellipse(p.x, p.y, s * .2, s * .48, 0, 0, Math.PI * 2); ctx.fill();
+            if (this.fxLevel === 0) {   // soft glow sprite instead of shadowBlur
+                ctx.globalAlpha = alpha;
+                ctx.drawImage(this._glow(), p.x - s, p.y - s * 1.2, s * 2, s * 2.4);
+            } else {
+                ctx.globalAlpha = alpha; ctx.fillStyle = '#dff7ff';
+                ctx.beginPath(); ctx.ellipse(p.x, p.y, s * .2, s * .48, 0, 0, Math.PI * 2); ctx.fill();
+            }
         } else if (p.type === 'gearSmoke') {
-            const gradient = ctx.createRadialGradient(p.x - s * .12, p.y - s * .18, 1, p.x, p.y, s);
-            gradient.addColorStop(0, 'rgba(255,220,150,.55)'); gradient.addColorStop(.4, 'rgba(140,85,50,.30)'); gradient.addColorStop(1, 'rgba(60,40,35,0)');
-            ctx.globalAlpha = .6 * alpha; ctx.fillStyle = gradient; ctx.beginPath(); ctx.ellipse(p.x, p.y, s * 1.2, s * .5, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = .6 * alpha;
+            ctx.drawImage(this._puff(), p.x - s * 1.2, p.y - s * .9, s * 2.4, s * 1.8);
         } else { this._drawFlame(p, alpha); }
         ctx.restore();
     }
