@@ -1,10 +1,10 @@
 <img src="assets/game_banner.jpg" alt="Dragline 2D Banner" width="70%">
 
-# Redline 2D
+# DragLine 2D
 
 [▶ Play DRAGLINE 2D](https://ahcity.github.io/Dragline_2D/)
 
-**Current Version:** Evo 2.3
+**Current Version:** Evo 2.4
 ## About
 
 Redline 2D is a 2D drag racing game with different cars, upgrades and tournaments. Race against AI and compete through the different events.
@@ -27,6 +27,27 @@ Redline 2D is a 2D drag racing game with different cars, upgrades and tournament
 
 * Use the on-screen controls.
 * The game runs in landscape mode on mobile.
+
+
+## 🆕 v2.4 Update
+
+### New
+
+- Added an updated garage with car previews.
+- Added a profile picture (PFP) security verification system.
+
+### Improved
+
+- Improved multiplayer connectivity and stability.
+- Improved driver profiles and the overall profile experience.
+- Improved the friends list and multiplayer player discovery.
+- Improved performance, tuning, and overall gameplay.
+- Improved opponent AI behavior.
+
+### Fixed
+
+- Fixed various multiplayer bugs.
+- Fixed other bugs and made general improvements.
 
 ## 🆕 v2.3 Update
 
